@@ -1,0 +1,28 @@
+# LLM 方法配置
+# 方法：ChatGLM2-6B + LoRA 微调（仅推理，训练通过 LlamaFactory 完成）
+
+seed: 42
+
+model:
+  # ChatGLM2-6B 基础模型路径（本地路径或 HuggingFace/ModelScope ID）
+  base_model: "THUDM/chatglm2-6b"
+  # LoRA 权重目录
+  lora_weights: "models/chatglm2-lora"
+  # 生成参数
+  max_new_tokens: 512
+  temperature: 0.1
+  # 推理设备（auto / cuda / cpu）
+  device: "auto"
+
+data:
+  # 推理输入文件（Alpaca 格式 JSON）
+  test_file: "data/processed/llm/test.json"
+  # 现有预测结果文件
+  predictions_file: "results/llm/predictions.jsonl"
+
+output:
+  dir: "results/llm"
+  predictions: "results/llm/predictions.jsonl"
+  metrics: "results/llm/metrics.json"
+  error_report: "results/llm/error_report.txt"
+  log: "results/llm/infer.log"

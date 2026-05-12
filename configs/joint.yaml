@@ -1,0 +1,44 @@
+# Joint 方法超参数配置
+# 方法：CasRel 端到端联合三元组抽取
+
+seed: 42
+
+data:
+  # 预处理后数据目录（由 scripts/preprocess.py 生成）
+  processed_dir: "data/processed/joint"
+  # 关系映射文件
+  rel2id: "data/processed/shared/rel2id.json"
+  # 数据集分割前缀
+  train_prefix: "train"
+  dev_prefix: "dev"
+  test_prefix: "test"
+
+model:
+  # BERT 预训练模型路径或 HuggingFace 模型名
+  # 优先使用本地路径（与 Pipeline NER 共用同一个 BERT）
+  bert_model: "methods/pipeline/ner/model"
+  # Adam 优化器学习率
+  learning_rate: 1.0e-5
+  batch_size: 6
+  max_length: 256
+  # 最大训练 epoch 数
+  epochs: 300
+  # 每隔多少 epoch 在验证集上评估一次
+  eval_every: 5
+  # 每隔多少步打印一次训练损失
+  log_every: 50
+  # CasRel 预测阈值（主语/宾语头尾概率 > threshold 则认定存在）
+  threshold: 0.5
+  # DuIE2.0 关系数量
+  rel_num: 49
+  # 是否使用多 GPU
+  multi_gpu: false
+  # 最佳模型保存路径
+  checkpoint: "results/joint/best.pt"
+
+output:
+  dir: "results/joint"
+  predictions: "results/joint/predictions.jsonl"
+  metrics: "results/joint/metrics.json"
+  error_report: "results/joint/error_report.txt"
+  log: "results/joint/train.log"

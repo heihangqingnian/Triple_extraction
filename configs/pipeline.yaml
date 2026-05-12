@@ -1,0 +1,53 @@
+# Pipeline 方法超参数配置
+# 方法：先 NER（Bert-BiLSTM-CRF）后 RE（Bert 分类器）
+
+seed: 42
+
+data:
+  # 预处理后数据目录（由 scripts/preprocess.py 生成）
+  processed_dir: "data/processed/pipeline"
+  # 共用的关系映射文件
+  rel2id: "data/processed/shared/rel2id.json"
+  # 实体类型映射文件
+  entity2id: "data/processed/shared/entity2id.json"
+
+ner:
+  # BERT 预训练模型路径或 HuggingFace 模型名
+  # 优先使用本地路径：methods/pipeline/ner/model/
+  bert_model: "methods/pipeline/ner/model"
+  # BERT 编码器学习率
+  learning_rate: 3.0e-5
+  # CRF 层学习率
+  crf_lr: 1.0e-3
+  batch_size: 16
+  max_length: 128
+  epochs: 15
+  dropout: 0.1
+  # 早停耐心值
+  patience: 10
+  # 最佳模型保存路径
+  checkpoint: "results/pipeline/ner_best.pt"
+
+re:
+  # BERT 预训练模型路径或 HuggingFace 模型名
+  bert_model: "hfl/chinese-bert-wwm"
+  # BERT 层学习率
+  bert_lr: 3.0e-5
+  # 非 BERT 层（线性头）学习率
+  other_lr: 3.0e-4
+  train_batch_size: 32
+  eval_batch_size: 12
+  max_seq_len: 256
+  epochs: 15
+  dropout: 0.1
+  # 关系类别数（DuIE2.0 共 48 个关系 + 1 个无关系）
+  num_tags: 49
+  # 最佳模型保存路径
+  checkpoint: "results/pipeline/re_best.pt"
+
+output:
+  dir: "results/pipeline"
+  predictions: "results/pipeline/predictions.jsonl"
+  metrics: "results/pipeline/metrics.json"
+  error_report: "results/pipeline/error_report.txt"
+  log: "results/pipeline/train.log"

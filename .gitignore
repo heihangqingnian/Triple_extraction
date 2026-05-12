@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 数据文件
+data/raw/
+data/processed/
+
+# 模型权重文件
+models/
+*.pt
+*.pth
+*.bin
+*.safetensors
+pytorch_model.bin
+model.safetensors
+vocab.txt
+tokenizer.json
+tokenizer_config.json
+config.json
+
+# 结果文件
+results/
+
+# TensorBoard 日志
+tensorboard/
+runs/
+events.out.tfevents.*
+
+# 日志文件
+*.log
+
+# 环境
+.env
+venv/
+env/
+.venv/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+**.txt
+**.json
+**.jsonl
+**.md
