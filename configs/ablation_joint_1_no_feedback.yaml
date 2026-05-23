@@ -1,0 +1,36 @@
+# CasRel 消融实验 1：移除主实体条件反馈
+# 验证级联机制对重叠关系抽取的关键作用
+
+seed: 42
+
+data:
+  processed_dir: "data/processed/joint"
+  rel2id: "data/processed/shared/rel2id.json"
+  train_prefix: "train"
+  dev_prefix: "dev"
+  test_prefix: "test"
+
+model:
+  bert_model: "methods/pipeline/ner/model"
+  learning_rate: 1.0e-5
+  batch_size: 6
+  max_length: 256
+  epochs: 300
+  eval_every: 5
+  log_every: 50
+  threshold: 0.5
+  rel_num: 49
+  multi_gpu: false
+  patience: 7
+  checkpoint: "results/joint_ablation1/best.pt"
+  use_subject_feedback: false  # 消融：移除主实体条件反馈
+  dual_encoder: false           # 使用共享单编码器
+  loss_alpha: 1.0
+  loss_beta: 1.0
+
+output:
+  dir: "results/joint_ablation1"
+  predictions: "results/joint_ablation1/predictions.jsonl"
+  metrics: "results/joint_ablation1/metrics.json"
+  error_report: "results/joint_ablation1/error_report.txt"
+  log: "results/joint_ablation1/train.log"

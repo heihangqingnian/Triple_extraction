@@ -61,3 +61,4 @@ Thumbs.db
 scripts/smoke_test.py
 
 results_old/
+scripts/ablation_smoke_test.py

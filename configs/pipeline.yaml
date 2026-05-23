@@ -17,7 +17,7 @@ ner:
   bert_model: "methods/pipeline/ner/model"
   # BERT 编码器学习率
   learning_rate: 3.0e-5
-  # CRF 层学习率
+  # CRF 层学习率（仅 use_crf=true 时有效）
   crf_lr: 1.0e-3
   batch_size: 16
   max_length: 128
@@ -27,6 +27,10 @@ ner:
   patience: 10
   # 最佳模型保存路径
   checkpoint: "results/pipeline/ner_best.pt"
+
+  # 消融实验参数
+  use_bilstm: true      # 是否使用 BiLSTM 层（false = BERT-CRF）
+  use_crf: true         # 是否使用 CRF 层（false = BERT-Linear/Softmax）
 
 re:
   # BERT 预训练模型路径或 HuggingFace 模型名
@@ -52,3 +56,6 @@ output:
   metrics: "results/pipeline/metrics.json"
   error_report: "results/pipeline/error_report.txt"
   log: "results/pipeline/train.log"
+  # 消融实验：可覆盖输出目录避免覆盖基准模型
+  # 例如：ablation_dir: "results/pipeline_ablation1"
+  ablation_dir: null

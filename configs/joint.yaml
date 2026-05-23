@@ -39,9 +39,18 @@ model:
   # 最佳模型保存路径
   checkpoint: "results/joint/best.pt"
 
+  # 消融实验参数
+  use_subject_feedback: true  # 是否使用主实体条件反馈（false = 移除级联机制）
+  dual_encoder: false          # 是否使用双独立编码器（true = 主语和宾语各一个 BERT）
+  loss_alpha: 1.0              # 主语损失权重（L_subject）
+  loss_beta: 1.0               # 宾语-关系损失权重（L_object_relation）
+
 output:
   dir: "results/joint"
   predictions: "results/joint/predictions.jsonl"
   metrics: "results/joint/metrics.json"
   error_report: "results/joint/error_report.txt"
   log: "results/joint/train.log"
+  # 消融实验：可覆盖输出目录避免覆盖基准模型
+  # 例如：ablation_dir: "results/joint_ablation1"
+  ablation_dir: null

@@ -24,6 +24,31 @@ Usage::
 
     # 使用自定义配置文件
     python main.py --method pipeline --mode train --config my_pipeline.yaml
+
+    # 消融实验示例
+    # Pipeline 消融 1：去除 BiLSTM（BERT-CRF）
+    python main.py --method pipeline --mode train --config configs/ablation_pipeline_1_no_bilstm.yaml
+    python main.py --method pipeline --mode evaluate --config configs/ablation_pipeline_1_no_bilstm.yaml
+
+    # Pipeline 消融 2：去除 CRF（BERT-Linear）
+    python main.py --method pipeline --mode train --config configs/ablation_pipeline_2_no_crf.yaml
+    python main.py --method pipeline --mode evaluate --config configs/ablation_pipeline_2_no_crf.yaml
+
+    # CasRel 消融 1：移除主实体反馈
+    python main.py --method joint --mode train --config configs/ablation_joint_1_no_feedback.yaml
+    python main.py --method joint --mode evaluate --config configs/ablation_joint_1_no_feedback.yaml
+
+    # CasRel 消融 2：双编码器
+    python main.py --method joint --mode train --config configs/ablation_joint_2_dual_encoder.yaml
+    python main.py --method joint --mode evaluate --config configs/ablation_joint_2_dual_encoder.yaml
+
+    # CasRel 消融 3a：损失权重 - 侧重实体
+    python main.py --method joint --mode train --config configs/ablation_joint_3_weights_entity.yaml
+    python main.py --method joint --mode evaluate --config configs/ablation_joint_3_weights_entity.yaml
+
+    # CasRel 消融 3b：损失权重 - 侧重关系
+    python main.py --method joint --mode train --config configs/ablation_joint_3_weights_relation.yaml
+    python main.py --method joint --mode evaluate --config configs/ablation_joint_3_weights_relation.yaml
 """
 
 import argparse
@@ -34,7 +59,7 @@ from pathlib import Path
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="三元组抽取对比研究 - 统一入口",
+        description="三元组抽取对比研究 - 统一入口（含消融实验支持）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

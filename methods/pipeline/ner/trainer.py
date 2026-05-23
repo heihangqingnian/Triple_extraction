@@ -57,7 +57,8 @@ def _evaluate(model: BertNer, loader: DataLoader, label2txt: Dict[int, str]) -> 
         # 原来: model(bert_input, batch_labels)[1]  ← 计算并丢弃 loss，浪费算力
         # 现在: model(bert_input)[0]               ← 直接获取 logits
         logits = model(bert_input)[0]
-        decoded = model.crf.decode(logits, mask=bert_input["attention_mask"].gt(0))
+        # 消融：支持 CRF 和非 CRF 解码
+        decoded = model.decode(logits, mask=bert_input["attention_mask"].gt(0))
         masks = bert_input["attention_mask"].detach().cpu().tolist()
         true_ids = batch_labels.detach().cpu().tolist()
 
@@ -108,23 +109,43 @@ def train(cfg: dict) -> None:
     train_loader = DataLoader(train_set, batch_size=ner_cfg["batch_size"], shuffle=True, collate_fn=collate)
     dev_loader = DataLoader(dev_set, batch_size=ner_cfg["batch_size"], shuffle=False, collate_fn=collate)
 
+    # 消融：传递 use_bilstm 和 use_crf 参数
+    use_bilstm = ner_cfg.get("use_bilstm", True)
+    use_crf = ner_cfg.get("use_crf", True)
+
+    logger.info(f"消融配置: use_bilstm={use_bilstm}, use_crf={use_crf}")
+
     model = BertNer(
         bert_path=ner_cfg["bert_model"],
         num_tags=num_tags,
         hidden_dim=768,
         dropout=ner_cfg["dropout"],
+        use_bilstm=use_bilstm,
+        use_crf=use_crf,
     ).to(device)
 
     # 差分学习率：CRF 层使用更高学习率
+    # 消融：当 use_crf=false 时，所有非 BERT 层使用统一学习率
     bert_params = [p for n, p in model.named_parameters() if "bert" in n]
     other_params = [p for n, p in model.named_parameters() if "bert" not in n]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": bert_params, "lr": ner_cfg["learning_rate"]},
-            {"params": other_params, "lr": ner_cfg["crf_lr"]},
-        ],
-        weight_decay=1e-4,
-    )
+
+    if use_crf:
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": bert_params, "lr": ner_cfg["learning_rate"]},
+                {"params": other_params, "lr": ner_cfg["crf_lr"]},
+            ],
+            weight_decay=1e-4,
+        )
+    else:
+        # 非 CRF 情况：所有层使用相同学习率
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": bert_params, "lr": ner_cfg["learning_rate"]},
+                {"params": other_params, "lr": ner_cfg["learning_rate"]},
+            ],
+            weight_decay=1e-4,
+        )
     scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
 
     best_f1 = 0.0
@@ -183,6 +204,10 @@ def evaluate(cfg: dict) -> Dict:
     ner_cfg = cfg["ner"]
     data_cfg = cfg["data"]
 
+    # 消融：读取消融参数
+    use_bilstm = ner_cfg.get("use_bilstm", True)
+    use_crf = ner_cfg.get("use_crf", True)
+
     _, txt2label, label2txt = _build_label_maps(data_cfg["entity2id"])
     tokenizer = BertTokenizer.from_pretrained(ner_cfg["bert_model"])
     collate = partial(ner_collate_fn, tokenizer=tokenizer, txt2label=txt2label, device=device)
@@ -190,7 +215,12 @@ def evaluate(cfg: dict) -> Dict:
     test_set = NerDataset(data_cfg["processed_dir"], "test", tokenizer, txt2label, device)
     test_loader = DataLoader(test_set, batch_size=ner_cfg["batch_size"], shuffle=False, collate_fn=collate)
 
-    model = BertNer(bert_path=ner_cfg["bert_model"], num_tags=len(txt2label)).to(device)
+    model = BertNer(
+        bert_path=ner_cfg["bert_model"],
+        num_tags=len(txt2label),
+        use_bilstm=use_bilstm,
+        use_crf=use_crf,
+    ).to(device)
     load_checkpoint(model, ner_cfg["checkpoint"], device=device)
 
     metrics = _evaluate(model, test_loader, label2txt)
@@ -214,10 +244,19 @@ def predict(texts: List[str], cfg: dict) -> List[List[Dict]]:
     ner_cfg = cfg["ner"]
     data_cfg = cfg["data"]
 
+    # 消融：读取消融参数
+    use_bilstm = ner_cfg.get("use_bilstm", True)
+    use_crf = ner_cfg.get("use_crf", True)
+
     _, txt2label, label2txt = _build_label_maps(data_cfg["entity2id"])
     tokenizer = BertTokenizer.from_pretrained(ner_cfg["bert_model"])
 
-    model = BertNer(bert_path=ner_cfg["bert_model"], num_tags=len(txt2label)).to(device)
+    model = BertNer(
+        bert_path=ner_cfg["bert_model"],
+        num_tags=len(txt2label),
+        use_bilstm=use_bilstm,
+        use_crf=use_crf,
+    ).to(device)
     load_checkpoint(model, ner_cfg["checkpoint"], device=device)
     model.eval()
 
@@ -253,7 +292,8 @@ def _predict_single(
 
     with torch.no_grad():
         logits = model(bert_input=enc)[0]
-        decoded = model.crf.decode(logits, mask=enc["attention_mask"].gt(0))[0]
+        # 消融：使用新的 decode 方法支持 CRF 和非 CRF 解码
+        decoded = model.decode(logits, mask=enc["attention_mask"].gt(0))[0]
 
     valid_len = int(enc["attention_mask"][0].sum().item())
     char_label_ids = decoded[1: valid_len - 1]

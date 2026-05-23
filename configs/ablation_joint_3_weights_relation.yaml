@@ -1,0 +1,36 @@
+# CasRel 消融实验 3b：损失权重 - 侧重关系
+# L_total = 1.0*L_subject + 2.0*L_object_relation
+
+seed: 42
+
+data:
+  processed_dir: "data/processed/joint"
+  rel2id: "data/processed/shared/rel2id.json"
+  train_prefix: "train"
+  dev_prefix: "dev"
+  test_prefix: "test"
+
+model:
+  bert_model: "methods/pipeline/ner/model"
+  learning_rate: 1.0e-5
+  batch_size: 6
+  max_length: 256
+  epochs: 300
+  eval_every: 5
+  log_every: 50
+  threshold: 0.5
+  rel_num: 49
+  multi_gpu: false
+  patience: 7
+  checkpoint: "results/joint_ablation4/best.pt"
+  use_subject_feedback: true   # 保留主实体反馈
+  dual_encoder: false           # 使用共享单编码器
+  loss_alpha: 1.0               # 消融：侧重关系
+  loss_beta: 2.0
+
+output:
+  dir: "results/joint_ablation4"
+  predictions: "results/joint_ablation4/predictions.jsonl"
+  metrics: "results/joint_ablation4/metrics.json"
+  error_report: "results/joint_ablation4/error_report.txt"
+  log: "results/joint_ablation4/train.log"

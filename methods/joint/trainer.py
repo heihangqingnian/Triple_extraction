@@ -100,6 +100,14 @@ def train(cfg: dict) -> None:
     model_cfg = cfg["model"]
     data_cfg = cfg["data"]
 
+    # 消融：读取消融参数
+    use_subject_feedback = model_cfg.get("use_subject_feedback", True)
+    dual_encoder = model_cfg.get("dual_encoder", False)
+    loss_alpha = model_cfg.get("loss_alpha", 1.0)
+    loss_beta = model_cfg.get("loss_beta", 1.0)
+
+    logger.info(f"消融配置: use_subject_feedback={use_subject_feedback}, dual_encoder={dual_encoder}, loss_alpha={loss_alpha}, loss_beta={loss_beta}")
+
     rel2id, id2rel = _load_rel2id(data_cfg["rel2id"])
     rel_num = len(rel2id)
     logger.info(f"关系数量: {rel_num}")
@@ -108,7 +116,12 @@ def train(cfg: dict) -> None:
 
     # BUG-7 fix: 使用 get_device() 而非硬编码 .cuda()，支持 CPU 环境
     # 原来: model = Casrel(...).cuda()  ← CUDA 不可用时直接崩溃
-    model = Casrel(bert_model=model_cfg["bert_model"], rel_num=rel_num).to(device)
+    model = Casrel(
+        bert_model=model_cfg["bert_model"],
+        rel_num=rel_num,
+        use_subject_feedback=use_subject_feedback,
+        dual_encoder=dual_encoder,
+    ).to(device)
     optimizer = optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=model_cfg["learning_rate"],
@@ -135,6 +148,11 @@ def train(cfg: dict) -> None:
     patience = model_cfg.get("patience", 3)  # 默认 3 次评估 = 15 epoch（≈论文 7 epoch×2/eval_every）
     patience_cnt = 0
 
+    # 性能监控
+    import time
+    training_start_time = time.time()
+    peak_gpu_memory = 0.0
+
     for epoch in range(model_cfg["epochs"]):
         model.train()
         # BUG-7 fix: DataPreFetcher 内部使用 CUDA stream，仅 CUDA 可用时启用
@@ -152,7 +170,11 @@ def train(cfg: dict) -> None:
             sub_t_loss = _bce_loss(data["sub_tails"], pred_st, data["mask"])
             obj_h_loss = _bce_loss(data["obj_heads"], pred_oh, data["mask"])
             obj_t_loss = _bce_loss(data["obj_tails"], pred_ot, data["mask"])
-            total_loss = sub_h_loss + sub_t_loss + obj_h_loss + obj_t_loss
+
+            # 消融：使用损失权重
+            sub_total = sub_h_loss + sub_t_loss
+            obj_total = obj_h_loss + obj_t_loss
+            total_loss = loss_alpha * sub_total + loss_beta * obj_total
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -160,10 +182,14 @@ def train(cfg: dict) -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
+            # 性能监控：记录峰值显存
+            if device.type == "cuda":
+                peak_gpu_memory = max(peak_gpu_memory, torch.cuda.max_memory_allocated() / 1024 / 1024)  # MB
+
             global_step += 1
             loss_sum    += total_loss.item()
-            sub_loss_sum += (sub_h_loss + sub_t_loss).item()
-            obj_loss_sum += (obj_h_loss + obj_t_loss).item()
+            sub_loss_sum += sub_total.item()
+            obj_loss_sum += obj_total.item()
             epoch_loss  += total_loss.item()
 
             if global_step % model_cfg["log_every"] == 0:
@@ -175,7 +201,8 @@ def train(cfg: dict) -> None:
                 logger.info(
                     f"epoch={epoch} step={global_step} "
                     f"total={avg_total:.4f} sub={avg_sub:.4f} obj={avg_obj:.4f} "
-                    f"[sub:obj比={avg_sub/(avg_obj+1e-9):.2f}，理想接近1.0]"
+                    f"[α={loss_alpha} β={loss_beta}] "
+                    f"sub:obj比={avg_sub/(avg_obj+1e-9):.2f}，理想接近1.0"
                 )
                 loss_sum = sub_loss_sum = obj_loss_sum = 0.0
 
@@ -206,7 +233,20 @@ def train(cfg: dict) -> None:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    logger.info(f"训练完成，最佳 F1={best_f1:.4f}")
+    training_time = time.time() - training_start_time
+    logger.info(f"训练完成，最佳 F1={best_f1:.4f}，训练时间={training_time:.2f}秒，峰值显存={peak_gpu_memory:.2f}MB")
+
+    # 保存性能指标
+    performance_metrics = {
+        "training_time": training_time,
+        "training_epochs": epoch + 1,
+        "peak_gpu_memory_mb": peak_gpu_memory,
+        "use_subject_feedback": use_subject_feedback,
+        "dual_encoder": dual_encoder,
+        "loss_alpha": loss_alpha,
+        "loss_beta": loss_beta,
+    }
+    save_json(performance_metrics, os.path.join(cfg["output"]["dir"], "metrics_performance.json"))
 
 
 # ──────────────────────────────────────────
@@ -351,6 +391,12 @@ def evaluate(cfg: dict) -> Dict:
     os.makedirs(out_dir, exist_ok=True)
     logger = get_logger("joint_eval", log_file=cfg["output"]["log"])
 
+    # 消融：读取消融参数
+    use_subject_feedback = model_cfg.get("use_subject_feedback", True)
+    dual_encoder = model_cfg.get("dual_encoder", False)
+    loss_alpha = model_cfg.get("loss_alpha", 1.0)
+    loss_beta = model_cfg.get("loss_beta", 1.0)
+
     rel2id, id2rel = _load_rel2id(data_cfg["rel2id"])
     rel_num = len(rel2id)
     tokenizer = BertTokenizer.from_pretrained(model_cfg["bert_model"])
@@ -361,7 +407,12 @@ def evaluate(cfg: dict) -> Dict:
         batch_size=1, is_test=True,
     )
 
-    model = Casrel(bert_model=model_cfg["bert_model"], rel_num=rel_num).to(device)
+    model = Casrel(
+        bert_model=model_cfg["bert_model"],
+        rel_num=rel_num,
+        use_subject_feedback=use_subject_feedback,
+        dual_encoder=dual_encoder,
+    ).to(device)
     load_checkpoint(model, model_cfg["checkpoint"], device=device)
     model.eval()
 

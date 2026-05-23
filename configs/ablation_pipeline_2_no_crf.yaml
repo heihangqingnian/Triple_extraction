@@ -1,0 +1,41 @@
+# Pipeline 消融实验 2：去除 CRF（BERT-Linear/Softmax）
+# 验证 CRF 全局约束对实体边界识别的提升效果
+
+seed: 42
+
+data:
+  processed_dir: "data/processed/pipeline"
+  rel2id: "data/processed/shared/rel2id.json"
+  entity2id: "data/processed/shared/entity2id.json"
+
+ner:
+  bert_model: "methods/pipeline/ner/model"
+  learning_rate: 3.0e-5
+  crf_lr: 1.0e-3
+  batch_size: 16
+  max_length: 128
+  epochs: 15
+  dropout: 0.1
+  patience: 10
+  checkpoint: "results/pipeline_ablation2/ner_best.pt"
+  use_bilstm: true  # 保留 BiLSTM
+  use_crf: false    # 消融：不使用 CRF，改用 Linear + Softmax
+
+re:
+  bert_model: "hfl/chinese-bert-wwm"
+  bert_lr: 3.0e-5
+  other_lr: 3.0e-4
+  train_batch_size: 32
+  eval_batch_size: 12
+  max_seq_len: 256
+  epochs: 15
+  dropout: 0.1
+  patience: 5
+  checkpoint: "results/pipeline_ablation2/re_best.pt"
+
+output:
+  dir: "results/pipeline_ablation2"
+  predictions: "results/pipeline_ablation2/predictions.jsonl"
+  metrics: "results/pipeline_ablation2/metrics.json"
+  error_report: "results/pipeline_ablation2/error_report.txt"
+  log: "results/pipeline_ablation2/train.log"
