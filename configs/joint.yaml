@@ -33,6 +33,9 @@ model:
   rel_num: 49
   # 是否使用多 GPU
   multi_gpu: false
+  # 早停：连续多少次评估（每 eval_every 个 epoch 一次）无提升则停止
+  # 论文附录 A：7 consecutive epochs；eval_every=5 → patience=3 ≈ 15 epoch
+  patience: 7
   # 最佳模型保存路径
   checkpoint: "results/joint/best.pt"
 

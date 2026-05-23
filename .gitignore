@@ -57,3 +57,5 @@ Thumbs.db
 **.json
 **.jsonl
 .claude/
+
+scripts/smoke_test.py

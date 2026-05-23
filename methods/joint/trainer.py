@@ -125,6 +125,10 @@ def train(cfg: dict) -> None:
     loss_sum = 0.0
     # 用于调试 BUG-6 修复：记录各分项 loss 历史，验证 sub 和 obj loss 是否处于同一量级
     sub_loss_sum = obj_loss_sum = 0.0
+    # 早停：按评估轮次计数（论文附录 A：连续 7 epoch 无提升则停止）
+    # 每 eval_every 个 epoch 评估一次，patience 以评估轮次为单位
+    patience = model_cfg.get("patience", 3)  # 默认 3 次评估 = 15 epoch（≈论文 7 epoch×2/eval_every）
+    patience_cnt = 0
 
     for epoch in range(model_cfg["epochs"]):
         model.train()
@@ -175,17 +179,24 @@ def train(cfg: dict) -> None:
             else:
                 data = next(data_iter, None)
 
-        # 定期评估
+        # 定期评估 + 早停（论文附录 A：连续 7 epoch 无提升则停止）
         if (epoch + 1) % model_cfg["eval_every"] == 0:
             model.eval()
             p, r, f1 = _eval_loop(dev_loader, model, id2rel, model_cfg["threshold"], device)
-            logger.info(f"[dev] epoch={epoch} F1={f1:.4f} P={p:.4f} R={r:.4f}")
+            logger.info(f"[dev] epoch={epoch+1} F1={f1:.4f} P={p:.4f} R={r:.4f}")
             model.train()
 
             if f1 > best_f1:
                 best_f1 = f1
+                patience_cnt = 0
                 save_checkpoint(model, model_cfg["checkpoint"], optimizer=optimizer, epoch=epoch, f1=best_f1)
                 logger.info(f"  -> 最佳模型已保存 (F1={best_f1:.4f})")
+            else:
+                patience_cnt += 1
+                logger.info(f"  早停计数 {patience_cnt}/{patience}（每 {model_cfg['eval_every']} epoch 评估一次）")
+                if patience_cnt >= patience:
+                    logger.info(f"早停触发，最佳 F1={best_f1:.4f}，已训练 {epoch+1} epoch")
+                    break
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
