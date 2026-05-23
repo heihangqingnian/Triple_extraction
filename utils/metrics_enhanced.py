@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 增强指标计算工具 - 用于消融实验
-支持细粒度指标、错误分析、重叠关系评估和性能监控
+依赖 utils/metrics.py 的通用功能，专注于消融实验特定指标
 """
 
-import time
 from collections import defaultdict
-from typing import Dict, List, Tuple, Any
-import torch
+from typing import Dict, List, Tuple
+from utils.metrics import InferenceTimer, PerformanceMonitor as BasePerformanceMonitor
 
 
 class EnhancedNERMetrics:
@@ -15,6 +14,7 @@ class EnhancedNERMetrics:
 
     def __init__(self):
         self.reset()
+        self._perf_monitor = BasePerformanceMonitor()
 
     def reset(self):
         """重置所有计数器"""
@@ -22,8 +22,6 @@ class EnhancedNERMetrics:
         self.true_positives = 0
         self.false_positives = 0
         self.false_negatives = 0
-        self.total_tokens = 0
-        self.correct_tokens = 0
 
         # 按实体类型统计
         self.by_type: Dict[str, Dict[str, int]] = defaultdict(
@@ -36,16 +34,10 @@ class EnhancedNERMetrics:
         self.partial_matches = 0  # 部分匹配（边界有交集）
         self.entity_lengths = []  # 实体长度分布
 
-        # 性能监控
-        self.inference_times = []
-        self.gpu_memory = []
-
     def update(
         self,
         pred_entities: List[Dict],
         gold_entities: List[Dict],
-        inference_time: float = 0.0,
-        gpu_memory: float = 0.0,
     ):
         """
         更新指标
@@ -53,15 +45,7 @@ class EnhancedNERMetrics:
         Args:
             pred_entities: 预测实体列表
             gold_entities: 真实实体列表
-            inference_time: 推理时间（秒）
-            gpu_memory: GPU 显存占用（MB）
         """
-        # 性能监控
-        if inference_time > 0:
-            self.inference_times.append(inference_time)
-        if gpu_memory > 0:
-            self.gpu_memory.append(gpu_memory)
-
         # 转换为集合便于查找
         pred_set = self._entities_to_set(pred_entities)
         gold_set = self._entities_to_set(gold_entities)
@@ -191,24 +175,12 @@ class EnhancedNERMetrics:
             "partial_matches": self.partial_matches,
         }
 
-    def get_performance_metrics(self) -> Dict[str, float]:
-        """获取性能指标"""
-        return {
-            "avg_inference_time": (
-                sum(self.inference_times) / len(self.inference_times)
-                if self.inference_times
-                else 0.0
-            ),
-            "max_inference_time": max(self.inference_times) if self.inference_times else 0.0,
-            "peak_gpu_memory_mb": max(self.gpu_memory) if self.gpu_memory else 0.0,
-            "avg_gpu_memory_mb": (
-                sum(self.gpu_memory) / len(self.gpu_memory) if self.gpu_memory else 0.0
-            ),
-        }
-
 
 class EnhancedTripleMetrics:
-    """增强的三元组指标计算类（CasRel 消融实验）"""
+    """增强的三元组指标计算类（CasRel 消融实验）
+
+    专注于消融实验特定指标，基础指标使用 utils/metrics.py 的 TripleMetrics
+    """
 
     def __init__(self):
         self.reset()
@@ -230,7 +202,7 @@ class EnhancedTripleMetrics:
         self.object_correct = 0   # 宾语正确
         self.relation_correct = 0  # 关系正确
 
-        # 重叠关系指标
+        # 重叠关系指标（消融实验重点关注）
         self.overlapping_samples = 0
         self.overlapping_tp = 0
         self.overlapping_fp = 0
@@ -244,16 +216,10 @@ class EnhancedTripleMetrics:
         self.object_errors = 0
         self.relation_errors = 0
 
-        # 性能监控
-        self.inference_times = []
-        self.gpu_memory = []
-
     def update(
         self,
         pred_triples: List[Tuple],
         gold_triples: List[Tuple],
-        inference_time: float = 0.0,
-        gpu_memory: float = 0.0,
     ):
         """
         更新指标
@@ -261,15 +227,7 @@ class EnhancedTripleMetrics:
         Args:
             pred_triples: 预测三元组列表
             gold_triples: 真实三元组列表
-            inference_time: 推理时间（秒）
-            gpu_memory: GPU 显存占用（MB）
         """
-        # 性能监控
-        if inference_time > 0:
-            self.inference_times.append(inference_time)
-        if gpu_memory > 0:
-            self.gpu_memory.append(gpu_memory)
-
         self.total_samples += 1
         pred_set = set(pred_triples)
         gold_set = set(gold_triples)
@@ -283,7 +241,7 @@ class EnhancedTripleMetrics:
         self.false_positives += fp
         self.false_negatives += fn
 
-        # 检测重叠关系
+        # 检测重叠关系（消融实验重点关注）
         has_overlap = self._detect_overlap(gold_triples)
         if has_overlap:
             self.overlapping_samples += 1
@@ -439,7 +397,7 @@ class EnhancedTripleMetrics:
         return results
 
     def get_overlap_metrics(self) -> Dict[str, float]:
-        """获取重叠关系指标"""
+        """获取重叠关系指标（消融实验重点关注）"""
         if self.overlapping_samples == 0:
             return {
                 "overlapping_f1": 0.0,
@@ -531,59 +489,3 @@ class EnhancedTripleMetrics:
             "object_errors": self.object_errors,
             "relation_errors": self.relation_errors,
         }
-
-    def get_performance_metrics(self) -> Dict[str, float]:
-        """获取性能指标"""
-        return {
-            "avg_inference_time": (
-                sum(self.inference_times) / len(self.inference_times)
-                if self.inference_times
-                else 0.0
-            ),
-            "max_inference_time": max(self.inference_times) if self.inference_times else 0.0,
-            "peak_gpu_memory_mb": max(self.gpu_memory) if self.gpu_memory else 0.0,
-            "avg_gpu_memory_mb": (
-                sum(self.gpu_memory) / len(self.gpu_memory) if self.gpu_memory else 0.0
-            ),
-        }
-
-
-class PerformanceMonitor:
-    """性能监控类"""
-
-    def __init__(self):
-        self.start_time = None
-        self.checkpoints = {}
-
-    def start(self):
-        """开始计时"""
-        self.start_time = time.time()
-        self.checkpoints = {}
-
-    def checkpoint(self, name: str):
-        """记录检查点"""
-        if self.start_time is None:
-            self.start()
-        elapsed = time.time() - self.start_time
-        self.checkpoints[name] = elapsed
-
-    def get_checkpoint_time(self, name: str) -> float:
-        """获取检查点时间"""
-        return self.checkpoints.get(name, 0.0)
-
-    def get_elapsed(self) -> float:
-        """获取总耗时"""
-        if self.start_time is None:
-            return 0.0
-        return time.time() - self.start_time
-
-    def get_gpu_memory(self) -> float:
-        """获取当前 GPU 显存占用（MB）"""
-        if torch.cuda.is_available():
-            return torch.cuda.max_memory_allocated() / 1024 / 1024
-        return 0.0
-
-    def reset_peak_memory(self):
-        """重置峰值显存"""
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()

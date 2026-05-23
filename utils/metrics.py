@@ -751,3 +751,56 @@ def save_error_report(
             cn_name = ERROR_TYPES.get(etype, etype)
             f.write(f"  {etype:35} {cn_name:40} {count:6} ({pct:6.2f}%) |{bar}\n")
     print(f"错误报告已保存到: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 十一、性能监控类（供消融实验使用）
+# ═══════════════════════════════════════════════════════════════════════
+
+class PerformanceMonitor:
+    """性能监控类，提供基础计时和 GPU 内存统计"""
+
+    def __init__(self):
+        self.start_time = None
+        self.checkpoints = {}
+
+    def start(self):
+        """开始计时"""
+        self.start_time = time.perf_counter()
+        self.checkpoints = {}
+
+    def checkpoint(self, name: str):
+        """记录检查点"""
+        if self.start_time is None:
+            self.start()
+        elapsed = time.perf_counter() - self.start_time
+        self.checkpoints[name] = elapsed
+
+    def get_checkpoint_time(self, name: str) -> float:
+        """获取检查点时间"""
+        return self.checkpoints.get(name, 0.0)
+
+    def get_elapsed(self) -> float:
+        """获取总耗时"""
+        if self.start_time is None:
+            return 0.0
+        return time.perf_counter() - self.start_time
+
+    def get_gpu_memory(self) -> float:
+        """获取当前 GPU 显存占用（MB）"""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return torch.cuda.max_memory_allocated() / 1024 / 1024
+        except Exception:
+            pass
+        return 0.0
+
+    def reset_peak_memory(self):
+        """重置峰值显存"""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
