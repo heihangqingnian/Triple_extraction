@@ -59,3 +59,5 @@ Thumbs.db
 .claude/
 
 scripts/smoke_test.py
+
+results_old/

@@ -5,7 +5,7 @@ CasRel 训练、评估、预测全流程
 
 import json
 import os
-import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -18,7 +18,12 @@ from methods.joint.dataset import DataPreFetcher, get_loader
 from methods.joint.model import Casrel
 from utils.common import get_device, get_logger, set_seed
 from utils.io_utils import load_checkpoint, save_checkpoint, save_json, save_jsonl
-from utils.metrics import TripleMetrics, analyze_errors, save_error_report
+from utils.metrics import (
+    ComprehensiveMetrics, TripleMetrics, InferenceTimer,
+    count_parameters, model_size_mb, gpu_memory_stats, reset_gpu_peak_memory,
+    analyze_errors, save_error_report, export_error_cases, per_relation_metrics,
+    print_per_relation_table,
+)
 
 
 def _load_rel2id(rel2id_path: str) -> Tuple[Dict[str, int], Dict[str, str]]:
@@ -297,7 +302,7 @@ def _eval_loop(
     device: torch.device = None,
 ) -> Tuple[float, float, float]:
     """在 data_loader 上运行 CasRel 推理，返回 (precision, recall, f1)"""
-    correct = predict_n = gold_n = 0
+    metrics = TripleMetrics()
     use_cuda = (device is not None and device.type == "cuda")
 
     if use_cuda:
@@ -312,21 +317,15 @@ def _eval_loop(
             pred_triples, gold_triples = _extract_triples_from_batch(
                 data, model, id2rel, threshold
             )
-        pred_set = set(pred_triples)
-        gold_set = set(gold_triples)
-        correct   += len(pred_set & gold_set)
-        predict_n += len(pred_set)
-        gold_n    += len(gold_set)
+        metrics.update(pred_triples, gold_triples)
 
         if use_cuda:
             data = prefetcher.next()
         else:
             data = next(data_iter, None)
 
-    p = correct / (predict_n + 1e-10)
-    r = correct / (gold_n + 1e-10)
-    f1 = 2 * p * r / (p + r + 1e-10)
-    return p, r, f1
+    r = metrics.compute()
+    return r["precision"], r["recall"], r["f1"]
 
 
 # ──────────────────────────────────────────
@@ -335,18 +334,21 @@ def _eval_loop(
 
 def evaluate(cfg: dict) -> Dict:
     """
-    加载最佳模型，在测试集上评估。
+    加载最佳模型，在测试集上运行全面评估。
 
-    BUG-7 fix: .cuda() → .to(device)，支持 CPU 环境。
-    BUG-10 fix: 使用 TripleMetrics（与 Pipeline 保持一致），替代手写计数。
-    BUG-13 fix: 保存样本级预测结果到 predictions.jsonl，支持事后分析。
-    同时调用 analyze_errors 生成错误类型报告（与 Pipeline evaluate 对齐）。
+    输出文件（全部持久化到 cfg["output"]["dir"]）：
+      metrics.json        — 严格/宽松 × 微平均/宏平均 + 推理速度 + 模型参数
+      predictions.jsonl   — 每条样本的预测与金标三元组
+      error_report.txt    — 错误类型汇总（带占比柱状图）
+      error_cases.txt     — 错误案例详情（每条样本的具体错误三元组及类型）
+      per_relation.txt    — 按关系类型分解的 P/R/F1 表格
     """
     set_seed(cfg["seed"])
     device = get_device()
     model_cfg = cfg["model"]
-    data_cfg = cfg["data"]
-    os.makedirs(cfg["output"]["dir"], exist_ok=True)
+    data_cfg  = cfg["data"]
+    out_dir   = cfg["output"]["dir"]
+    os.makedirs(out_dir, exist_ok=True)
     logger = get_logger("joint_eval", log_file=cfg["output"]["log"])
 
     rel2id, id2rel = _load_rel2id(data_cfg["rel2id"])
@@ -359,18 +361,26 @@ def evaluate(cfg: dict) -> Dict:
         batch_size=1, is_test=True,
     )
 
-    # BUG-7 fix: .to(device) 替代 .cuda()
     model = Casrel(bert_model=model_cfg["bert_model"], rel_num=rel_num).to(device)
     load_checkpoint(model, model_cfg["checkpoint"], device=device)
     model.eval()
 
-    # BUG-10 fix: 使用 TripleMetrics 与 Pipeline 保持完全一致的评估逻辑
-    metrics = TripleMetrics()
-    sample_outputs = []
-    error_counts: Dict = {}
+    # 模型统计
+    params  = count_parameters(model)
+    size_mb = model_size_mb(model)
+    logger.info(f"模型参数: 总计={params['total']:,}  可训练={params['trainable']:,}  "
+                f"冻结={params['frozen']:,}  参数量≈{size_mb} MB")
+
+    reset_gpu_peak_memory()
+
+    metrics       = ComprehensiveMetrics()
+    timer         = InferenceTimer()
+    sample_outputs: List[Dict] = []
+    error_counts:   Dict       = {}
+    pred_triples_all: List[List] = []
+    gold_triples_all: List[List] = []
     use_cuda = (device.type == "cuda")
 
-    t_start = time.perf_counter()
     if use_cuda:
         prefetcher = DataPreFetcher(test_loader)
         data = prefetcher.next()
@@ -380,28 +390,29 @@ def evaluate(cfg: dict) -> Dict:
 
     sample_idx = 0
     while data is not None:
+        timer.start()
         with torch.no_grad():
-            pred_triples_tuples, gold_triples_tuples = _extract_triples_from_batch(
+            pred_tuples, gold_tuples = _extract_triples_from_batch(
                 data, model, id2rel, model_cfg["threshold"]
             )
+        timer.stop(num_samples=1, num_triples=len(pred_tuples))
 
-        # 转为 dict 格式供 TripleMetrics 使用（兼容 _triple_to_key）
         pred_dicts = [{"subject": s, "predicate": p, "object": {"@value": o}}
-                      for s, p, o in pred_triples_tuples]
+                      for s, p, o in pred_tuples]
         gold_dicts = [{"subject": s, "predicate": p, "object": {"@value": o}}
-                      for s, p, o in gold_triples_tuples]
+                      for s, p, o in gold_tuples]
 
         metrics.update(pred_dicts, gold_dicts)
+        pred_triples_all.append(pred_dicts)
+        gold_triples_all.append(gold_dicts)
 
-        # 错误分析（BUG-15 fix 已在 metrics.py 中：Joint 也提取预测实体集）
         errs = analyze_errors(pred_dicts, gold_dicts)
         for k, v in errs.items():
             error_counts[k] = error_counts.get(k, 0) + v
 
-        # BUG-13 fix: 保存样本级预测结果
         tokens = data["tokens"][0]
         sample_outputs.append({
-            "text": "".join(t.lstrip("##") for t in tokens if t not in ("[CLS]", "[SEP]")),
+            "text":         "".join(t.lstrip("##") for t in tokens if t not in ("[CLS]", "[SEP]")),
             "pred_triples": pred_dicts,
             "gold_triples": gold_dicts,
         })
@@ -412,17 +423,62 @@ def evaluate(cfg: dict) -> Dict:
             data = next(data_iter, None)
         sample_idx += 1
 
-    elapsed = time.perf_counter() - t_start
+    # ── 汇总结果 ──────────────────────────────────────────────────────
     result = metrics.compute()
-    result["inference_time_seconds"] = round(elapsed, 2)
-    result["samples_per_second"] = round(sample_idx / elapsed, 2)
+    speed  = timer.compute()
+    gpu_mem = gpu_memory_stats()
+
+    result["inference"]   = speed
+    result["model"]       = {"params": params, "size_mb": size_mb}
+    result["gpu_memory"]  = gpu_mem
     result["error_counts"] = error_counts
 
+    # 按关系分解 P/R/F1
+    rel_metrics = per_relation_metrics(pred_triples_all, gold_triples_all)
+    result["per_relation"] = rel_metrics
+
+    # ── 打印报告 ─────────────────────────────────────────────────────
     metrics.print_report("Joint 端到端评估")
+    logger.info(
+        f"推理速度: {speed['samples_per_sec']} samples/s  "
+        f"| 平均延迟 {speed['avg_latency_ms']} ms/sample  "
+        f"| 总耗时 {speed['total_time_s']} s"
+    )
+    if gpu_mem.get("available"):
+        logger.info(
+            f"显存峰值: allocated={gpu_mem['peak_allocated_mb']} MB  "
+            f"reserved={gpu_mem['peak_reserved_mb']} MB"
+        )
+
+    # ── 持久化输出文件 ────────────────────────────────────────────────
     save_json(result, cfg["output"]["metrics"])
     save_jsonl(sample_outputs, cfg["output"]["predictions"])
     save_error_report(error_counts, cfg["output"]["error_report"], model_name="joint")
-    logger.info(f"Joint 评估完成，结果已保存到: {cfg['output']['dir']}")
+
+    # 错误案例详情文本
+    cases_path = str(Path(out_dir) / "error_cases.txt")
+    export_error_cases(sample_outputs, cases_path)
+
+    # 按关系 P/R/F1 文本表格
+    rel_path = Path(out_dir) / "per_relation.txt"
+    with open(rel_path, "w", encoding="utf-8") as f:
+        f.write(f"{'关系类型':<22} {'P':>8} {'R':>8} {'F1':>8} {'Support':>9} {'Pred':>7} {'Correct':>8}\n")
+        f.write(f"{'-' * 72}\n")
+        rows = sorted(
+            [(k, v) for k, v in rel_metrics.items() if k != "__overall__"],
+            key=lambda x: -x[1]["support"],
+        )
+        for rel, m in rows:
+            f.write(f"{rel:<22} {m['precision']:>8.4f} {m['recall']:>8.4f} {m['f1']:>8.4f} "
+                    f"{m['support']:>9} {m['predicted']:>7} {m['correct']:>8}\n")
+        if "__overall__" in rel_metrics:
+            ov = rel_metrics["__overall__"]
+            f.write(f"{'-' * 72}\n")
+            f.write(f"{'Overall':<22} {ov['precision']:>8.4f} {ov['recall']:>8.4f} {ov['f1']:>8.4f} "
+                    f"{ov['support']:>9} {ov['predicted']:>7} {ov['correct']:>8}\n")
+    print(f"关系级指标已保存到: {rel_path}")
+
+    logger.info(f"Joint 评估完成，所有结果已保存到: {out_dir}")
     return result
 
 

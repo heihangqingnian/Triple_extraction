@@ -5,7 +5,7 @@ Pipeline 方法端到端流程：NER → RE → 三元组评估
 
 import json
 import os
-import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -17,7 +17,11 @@ from methods.pipeline.ner.model import BertNer
 from methods.pipeline.re.model import BertForRelationExtraction
 from utils.common import get_device, get_logger, set_seed
 from utils.io_utils import load_checkpoint, load_jsonl, save_json, save_jsonl
-from utils.metrics import TripleMetrics, analyze_errors, save_error_report
+from utils.metrics import (
+    ComprehensiveMetrics, InferenceTimer,
+    count_parameters, model_size_mb, gpu_memory_stats, reset_gpu_peak_memory,
+    analyze_errors, save_error_report, export_error_cases, per_relation_metrics,
+)
 
 
 # ──────────────────────────────────────────
@@ -217,52 +221,79 @@ def run(cfg: dict, mode: str, input_path: Optional[str] = None, output_path: Opt
 
 
 def _evaluate(cfg: dict) -> Dict:
-    """在测试集上运行 Pipeline 端到端评估"""
+    """
+    在测试集上运行 Pipeline 端到端评估。
+
+    输出文件（全部持久化到 cfg["output"]["dir"]）：
+      metrics.json        — 严格/宽松 × 微平均/宏平均 + 推理速度 + 模型参数
+      predictions.jsonl   — 每条样本的预测实体、预测三元组与金标三元组
+      error_report.txt    — 错误类型汇总（带占比柱状图）
+      error_cases.txt     — 错误案例详情（每条样本的具体错误三元组及类型）
+      per_relation.txt    — 按关系类型分解的 P/R/F1 表格
+    """
     device = get_device()
+    out_dir = cfg["output"]["dir"]
     logger = get_logger("pipeline_eval", log_file=cfg["output"]["log"])
-    os.makedirs(cfg["output"]["dir"], exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
 
     logger.info("加载 NER 模型...")
     ner_model, ner_tokenizer, _, ner_label2txt = _load_ner_model(cfg, device)
     logger.info("加载 RE 模型...")
     re_model, re_tokenizer, rel2id, id2rel = _load_re_model(cfg, device)
 
-    test_file = os.path.join(
-        cfg["data"]["processed_dir"], "test", "pipeline_test.jsonl"
+    # 模型参数统计（NER + RE 分别记录）
+    ner_params = count_parameters(ner_model)
+    re_params  = count_parameters(re_model)
+    ner_mb     = model_size_mb(ner_model)
+    re_mb      = model_size_mb(re_model)
+    total_params = ner_params["total"] + re_params["total"]
+    logger.info(
+        f"NER 参数: {ner_params['total']:,} ({ner_mb} MB)  "
+        f"RE 参数: {re_params['total']:,} ({re_mb} MB)  "
+        f"Pipeline 总参数: {total_params:,}"
     )
+
+    reset_gpu_peak_memory()
+
+    test_file = os.path.join(cfg["data"]["processed_dir"], "test", "pipeline_test.jsonl")
     if not os.path.exists(test_file):
         raise FileNotFoundError(f"测试文件不存在: {test_file}")
 
     samples = load_jsonl(test_file)
-    metrics = TripleMetrics()
-    sample_outputs = []
-    error_counts: Dict = {}
+    metrics       = ComprehensiveMetrics()
+    timer         = InferenceTimer()
+    sample_outputs:   List[Dict] = []
+    error_counts:     Dict       = {}
+    pred_triples_all: List[List] = []
+    gold_triples_all: List[List] = []
 
-    # debug_first_n > 0 时，对前 N 条样本打印 RE 实体位置调试信息（验证 BUG-1 修复效果）
-    DEBUG_SAMPLES = 3
+    DEBUG_SAMPLES = 3  # 前 N 条打印 RE 实体位置调试信息（验证 BUG-1 修复效果）
 
-    t_start = time.perf_counter()
     for sample_idx, sample in enumerate(tqdm(samples, desc="pipeline_eval")):
-        text = sample["text"]
+        text         = sample["text"]
         gold_triples = sample.get("gold_triples", [])
 
+        timer.start()
         entities, _ = _predict_single(
             text, ner_model, ner_tokenizer, ner_label2txt,
             cfg["ner"]["max_length"], device
         )
 
-        # 前 DEBUG_SAMPLES 条打印 RE 位置调试信息，便于验证 BUG-1 是否已修复
         dbg = 2 if sample_idx < DEBUG_SAMPLES else 0
         if dbg:
-            print(f"\n[位置调试] 样本 #{sample_idx}: text='{text[:40]}...' 实体={[e['text'] for e in entities]}")
+            print(f"\n[位置调试] 样本 #{sample_idx}: text='{text[:40]}...' "
+                  f"实体={[e['text'] for e in entities]}")
 
         pred_triples, _ = _predict_re_for_sample(
             text, entities, re_model, re_tokenizer,
             rel2id, id2rel, cfg["re"], device,
             debug_first_n=dbg,
         )
+        timer.stop(num_samples=1, num_triples=len(pred_triples))
 
         metrics.update(pred_triples, gold_triples)
+        pred_triples_all.append(pred_triples)
+        gold_triples_all.append(gold_triples)
 
         pred_entity_texts = {e["text"] for e in entities}
         errs = analyze_errors(pred_triples, gold_triples, pred_entity_texts)
@@ -270,23 +301,69 @@ def _evaluate(cfg: dict) -> Dict:
             error_counts[k] = error_counts.get(k, 0) + v
 
         sample_outputs.append({
-            "text": text,
+            "text":          text,
             "pred_entities": entities,
-            "pred_triples": pred_triples,
-            "gold_triples": gold_triples,
+            "pred_triples":  pred_triples,
+            "gold_triples":  gold_triples,
         })
 
-    elapsed = time.perf_counter() - t_start
-    result = metrics.compute()
-    result["inference_time_seconds"] = round(elapsed, 2)
-    result["samples_per_second"] = round(len(samples) / elapsed, 2)
+    # ── 汇总结果 ──────────────────────────────────────────────────────
+    result  = metrics.compute()
+    speed   = timer.compute()
+    gpu_mem = gpu_memory_stats()
+
+    result["inference"]    = speed
+    result["model"] = {
+        "ner":   {"params": ner_params, "size_mb": ner_mb},
+        "re":    {"params": re_params,  "size_mb": re_mb},
+        "total_params": total_params,
+    }
+    result["gpu_memory"]   = gpu_mem
     result["error_counts"] = error_counts
 
+    rel_metrics = per_relation_metrics(pred_triples_all, gold_triples_all)
+    result["per_relation"] = rel_metrics
+
+    # ── 打印报告 ─────────────────────────────────────────────────────
     metrics.print_report("Pipeline 端到端评估")
+    logger.info(
+        f"推理速度: {speed['samples_per_sec']} samples/s  "
+        f"| 平均延迟 {speed['avg_latency_ms']} ms/sample  "
+        f"| 总耗时 {speed['total_time_s']} s"
+    )
+    if gpu_mem.get("available"):
+        logger.info(
+            f"显存峰值: allocated={gpu_mem['peak_allocated_mb']} MB  "
+            f"reserved={gpu_mem['peak_reserved_mb']} MB"
+        )
+
+    # ── 持久化输出文件 ────────────────────────────────────────────────
     save_json(result, cfg["output"]["metrics"])
     save_jsonl(sample_outputs, cfg["output"]["predictions"])
     save_error_report(error_counts, cfg["output"]["error_report"], model_name="pipeline")
-    logger.info(f"评估完成，结果已保存到: {cfg['output']['dir']}")
+
+    cases_path = Path(out_dir) / "error_cases.txt"
+    export_error_cases(sample_outputs, cases_path)
+
+    rel_path = Path(out_dir) / "per_relation.txt"
+    with open(rel_path, "w", encoding="utf-8") as f:
+        f.write(f"{'关系类型':<22} {'P':>8} {'R':>8} {'F1':>8} {'Support':>9} {'Pred':>7} {'Correct':>8}\n")
+        f.write(f"{'-' * 72}\n")
+        rows = sorted(
+            [(k, v) for k, v in rel_metrics.items() if k != "__overall__"],
+            key=lambda x: -x[1]["support"],
+        )
+        for rel, m in rows:
+            f.write(f"{rel:<22} {m['precision']:>8.4f} {m['recall']:>8.4f} {m['f1']:>8.4f} "
+                    f"{m['support']:>9} {m['predicted']:>7} {m['correct']:>8}\n")
+        if "__overall__" in rel_metrics:
+            ov = rel_metrics["__overall__"]
+            f.write(f"{'-' * 72}\n")
+            f.write(f"{'Overall':<22} {ov['precision']:>8.4f} {ov['recall']:>8.4f} {ov['f1']:>8.4f} "
+                    f"{ov['support']:>9} {ov['predicted']:>7} {ov['correct']:>8}\n")
+    print(f"关系级指标已保存到: {rel_path}")
+
+    logger.info(f"评估完成，所有结果已保存到: {out_dir}")
     return result
 
 
