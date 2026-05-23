@@ -3,8 +3,6 @@
 统一三元组评估指标
 """
 
-import json
-import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Union
@@ -114,30 +112,55 @@ class TripleMetrics:
 # ──────────────────────────────────────────
 
 ERROR_TYPES = {
-    "complex_sentence_error": "复杂句子错误",
-    "entity_missing_error": "实体缺失错误",
-    "entity_boundary_error": "实体边界错误",
-    "relation_type_error": "关系类型错误",
-    "entity_type_error": "实体类型错误",
-    "spurious_triple_error": "虚假三元组错误",
-    "relation_direction_error": "关系方向错误",
-    "other_fn_error": "其他功能错误",
-    "overlap_relation_error": "重叠关系错误",
+    # 实体层面错误
+    "entity_boundary_error":      "实体边界切分错误（定位到但边界不准）",
+    "entity_fn_error":            "实体漏抽（实体完全未被捕获）",
+    "entity_fp_error":            "实体无中生有（幻觉实体）",
+    # 关系层面错误
+    "relation_misclassification": "关系分类错误（实体正确，关系类型错）",
+    "relation_direction_error":   "关系方向反转（主宾角色颠倒）",
+    # 组合配对层面错误
+    "wrong_pairing_error":        "张冠李戴（无关实体被错误配对）",
+    "triplet_fn_error":           "三元组完全漏报（整体缺失）",
+    # 复杂场景重叠遗漏（Joint 模型特有场景）
+    "seo_failure":                "一主多客遗漏 SEO（共主语多宾语场景部分遗漏）",
+    "epo_failure":                "实体对多关系遗漏 EPO（同实体对多关系场景部分遗漏）",
+    # 其他多余预测兜底
+    "complex_sentence_error":     "复杂句子混淆（其他多余预测）",
 }
+
+
+def _has_boundary_overlap(entity_text: str, entity_set: Set[str]) -> bool:
+    """判断 entity_text 是否与 entity_set 中某实体有子串重叠（用于边界错误检测）"""
+    if not entity_text:
+        return False
+    for e in entity_set:
+        if e and e != entity_text and (entity_text in e or e in entity_text):
+            return True
+    return False
 
 
 def analyze_errors(
     pred_triples: List,
     gold_triples: List,
     pred_entity_texts: Optional[Set[str]] = None,
+    verbose: bool = False,
 ) -> Dict[str, int]:
     """
-    分析预测错误类型，返回各错误类型的计数
+    分析预测错误类型，返回各错误类型的计数。
+
+    错误分类遵循以下四层体系：
+      1. 实体层面：边界错误 / 漏抽 / 无中生有
+      2. 关系层面：分类错误 / 方向反转
+      3. 配对层面：张冠李戴 / 三元组完全漏报
+      4. 复杂场景：SEO 遗漏 / EPO 遗漏
 
     Args:
-        pred_triples: 预测三元组
-        gold_triples: 标注三元组
-        pred_entity_texts: 预测出的实体文本集合（Pipeline 方法专用，用于区分 NER 错误和 RE 错误）
+        pred_triples: 预测三元组列表
+        gold_triples: 标注三元组列表
+        pred_entity_texts: 预测实体文本集合；Pipeline 传 NER 输出实体，
+                           Joint 不传（自动从预测三元组中提取）
+        verbose: True 时在终端打印每条错误的分类细节（用于调试验证）
 
     Returns:
         错误类型计数字典
@@ -146,29 +169,107 @@ def analyze_errors(
     gold_set = _triples_to_set(gold_triples)
     counts: Dict[str, int] = defaultdict(int)
 
-    # 分析缺失三元组（金标但未预测出）
-    for gs, gp, go in gold_set - pred_set:
-        if pred_entity_texts is not None and (gs not in pred_entity_texts or go not in pred_entity_texts):
-            counts["entity_missing_error"] += 1
-        elif any(ps == go and po == gs and pp == gp for ps, pp, po in pred_set):
-            counts["relation_direction_error"] += 1
-        elif any(ps == gs and po == go for ps, _, po in pred_set):
-            counts["relation_type_error"] += 1
-        elif any(ps == gs and pp == gp for ps, pp, _ in pred_set):
-            counts["entity_boundary_error"] += 1
-        else:
-            counts["other_fn_error"] += 1
+    # 构建所有金标实体文本集合
+    gold_entities: Set[str] = {e for gs, _, go in gold_set for e in (gs, go)}
 
-    # 分析多余三元组（预测了但不在金标中）
-    for ps, pp, po in pred_set - gold_set:
-        if not any(gs == ps or go == po for gs, _, go in gold_set):
-            counts["spurious_triple_error"] += 1
-        elif (po, pp, ps) in gold_set:
+    # 若未从外部传入预测实体集（Joint 场景），从预测三元组中自动提取
+    if pred_entity_texts is None:
+        pred_entity_texts = {e for ps, _, po in pred_set for e in (ps, po)}
+
+    if verbose:
+        print(f"\n[analyze_errors] pred={len(pred_set)} gold={len(gold_set)} "
+              f"pred_entities={len(pred_entity_texts)} gold_entities={len(gold_entities)}")
+
+    # ── 分析缺失三元组（gold_set - pred_set）─────────────────────────────
+    # 每条缺失三元组按优先级分类，归入最具体的错误类型
+    for gs, gp, go in gold_set - pred_set:
+        label = ""
+
+        # 优先级 1：关系方向反转 —— 存在 (go, gp, gs) 在预测集中
+        if (go, gp, gs) in pred_set:
             counts["relation_direction_error"] += 1
+            label = "relation_direction_error"
+
+        # 优先级 2：EPO 遗漏 —— 同实体对出现但关系类型错，
+        #   且该实体对 (gs, go) 在 gold 中另有关系已被正确预测
+        elif any(ps == gs and po == go and pp != gp for ps, pp, po in pred_set):
+            sibling_predicted = any(
+                (gs, gp2, go) in pred_set
+                for gs2, gp2, go2 in gold_set
+                if gs2 == gs and go2 == go and gp2 != gp
+            )
+            if sibling_predicted:
+                counts["epo_failure"] += 1
+                label = "epo_failure"
+            else:
+                counts["relation_misclassification"] += 1
+                label = "relation_misclassification"
+
+        # 优先级 3：SEO 遗漏 —— 同(主语, 关系)对出现但宾语不同，
+        #   且该(gs, gp)对在 gold 中另有宾语已被正确预测
+        elif any(ps == gs and pp == gp and po != go for ps, pp, po in pred_set):
+            sibling_predicted = any(
+                (gs, gp, go2) in pred_set
+                for gs2, gp2, go2 in gold_set
+                if gs2 == gs and gp2 == gp and go2 != go
+            )
+            if sibling_predicted:
+                counts["seo_failure"] += 1
+                label = "seo_failure"
+            else:
+                counts["triplet_fn_error"] += 1
+                label = "triplet_fn_error"
+
+        # 优先级 4：实体边界错误 —— 实体大体正确但边界不准（子串/超串匹配）
+        elif _has_boundary_overlap(gs, pred_entity_texts) or \
+                _has_boundary_overlap(go, pred_entity_texts):
+            counts["entity_boundary_error"] += 1
+            label = "entity_boundary_error"
+
+        # 优先级 5：实体漏抽 —— 主语或宾语完全不在预测实体集中
+        elif gs not in pred_entity_texts or go not in pred_entity_texts:
+            counts["entity_fn_error"] += 1
+            label = "entity_fn_error"
+
+        # 优先级 6：兜底 —— 三元组整体漏报（实体存在，关系无对应）
+        else:
+            counts["triplet_fn_error"] += 1
+            label = "triplet_fn_error"
+
+        if verbose:
+            print(f"  [MISS] ({gs}, {gp}, {go})  → {label}")
+
+    # ── 分析多余三元组（pred_set - gold_set）─────────────────────────────
+    for ps, pp, po in pred_set - gold_set:
+        label = ""
+
+        # 优先级 1：关系方向反转 —— (po, pp, ps) 在金标中
+        if (po, pp, ps) in gold_set:
+            counts["relation_direction_error"] += 1
+            label = "relation_direction_error"
+
+        # 优先级 2：关系分类错误 —— 实体对 (ps, po) 在金标中有对应（但关系类型错）
         elif any(gs == ps and go == po for gs, _, go in gold_set):
-            counts["relation_type_error"] += 1
+            counts["relation_misclassification"] += 1
+            label = "relation_misclassification"
+
+        # 优先级 3：实体无中生有 —— 主宾语均不在任何金标实体中
+        elif ps not in gold_entities and po not in gold_entities:
+            counts["entity_fp_error"] += 1
+            label = "entity_fp_error"
+
+        # 优先级 4：张冠李戴 —— 实体各自存在于金标，但这对组合无任何金标关系
+        elif ps in gold_entities and po in gold_entities:
+            counts["wrong_pairing_error"] += 1
+            label = "wrong_pairing_error"
+
+        # 优先级 5：兜底 —— 复杂句子中的其他混淆
         else:
             counts["complex_sentence_error"] += 1
+            label = "complex_sentence_error"
+
+        if verbose:
+            print(f"  [EXTRA] ({ps}, {pp}, {po})  → {label}")
 
     return dict(counts)
 
@@ -191,5 +292,5 @@ def save_error_report(
             pct = count / total * 100 if total else 0
             bar = "#" * int(pct * 0.6)
             cn_name = ERROR_TYPES.get(etype, etype)
-            f.write(f"  {etype:30} {cn_name:12} {count:6} ({pct:6.2f}%) |{bar}\n")
+            f.write(f"  {etype:35} {cn_name:40} {count:6} ({pct:6.2f}%) |{bar}\n")
     print(f"错误报告已保存到: {output_path}")

@@ -33,15 +33,16 @@ re:
   bert_model: "hfl/chinese-bert-wwm"
   # BERT 层学习率
   bert_lr: 3.0e-5
-  # 非 BERT 层（线性头）学习率
+  # 非 BERT 层（线性头）学习率（暂未差分，保留备用）
   other_lr: 3.0e-4
   train_batch_size: 32
   eval_batch_size: 12
   max_seq_len: 256
   epochs: 15
   dropout: 0.1
-  # 关系类别数（DuIE2.0 共 48 个关系 + 1 个无关系）
-  num_tags: 49
+  # 早停耐心值（连续 patience 个 epoch 验证集 F1 不提升则停止）
+  patience: 5
+  # 注：关系类别数由 rel2id 文件动态计算，无需在此硬编码
   # 最佳模型保存路径
   checkpoint: "results/pipeline/re_best.pt"
 

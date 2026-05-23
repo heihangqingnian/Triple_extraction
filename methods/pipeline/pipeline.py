@@ -6,7 +6,6 @@ Pipeline 方法端到端流程：NER → RE → 三元组评估
 import json
 import os
 import time
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -72,6 +71,25 @@ def _mark_entities(text: str, sub: Dict, obj: Dict) -> str:
     return marked
 
 
+def _get_marked_entity_positions(marked: str, sub_ent: Dict, obj_ent: Dict):
+    """
+    在标记文本中查找实体的正确字符位置（BUG-1 fix 推理端）。
+
+    原来: 用原始文本坐标 +1（[CLS] offset）作为 BERT 提取位置，
+          实际指向的是 '#'/'$' 标记符而非实体 token，存在系统性错位。
+    现在: 在标记文本中搜索 '#sub_text' 和 '$obj_text'，精确定位实体首字符。
+    """
+    sub_pos = marked.find("#" + sub_ent["text"])
+    obj_pos = marked.find("$" + obj_ent["text"])
+    if sub_pos == -1 or obj_pos == -1:
+        return None
+    sub_start_m = sub_pos + 1
+    sub_end_m   = sub_start_m + len(sub_ent["text"]) - 1
+    obj_start_m = obj_pos + 1
+    obj_end_m   = obj_start_m + len(obj_ent["text"]) - 1
+    return [sub_start_m, sub_end_m, obj_start_m, obj_end_m]
+
+
 def _predict_re_for_sample(
     text: str,
     entities: List[Dict],
@@ -81,12 +99,19 @@ def _predict_re_for_sample(
     id2rel: Dict,
     re_cfg: dict,
     device: torch.device,
+    debug_first_n: int = 0,
 ) -> Tuple[List[Dict], int]:
-    """对文本中所有实体对运行 RE 模型，返回三元组列表和截断对数"""
+    """
+    对文本中所有实体对运行 RE 模型，返回三元组列表和截断对数。
+
+    Args:
+        debug_first_n: 大于 0 时打印前 N 个实体对的位置信息，用于验证 BUG-1 修复效果。
+    """
     no_rel_id = rel2id.get("无关系") or rel2id.get("NA") or max(id2rel.keys())
     triples: List[Dict] = []
     seen = set()
     trunc_count = 0
+    pair_idx = 0
 
     for sub_ent in entities:
         for obj_ent in entities:
@@ -105,21 +130,42 @@ def _predict_re_for_sample(
                 return_tensors="pt",
             )
             enc = {k: v.to(device) for k, v in enc.items()}
-            positions = [sub_ent["start"], sub_ent["end"], obj_ent["start"], obj_ent["end"]]
+
+            # BUG-1 fix: 计算实体在标记文本中的位置，而非原始文本位置
+            positions = _get_marked_entity_positions(marked, sub_ent, obj_ent)
+            if positions is None:
+                continue  # 标记文本中找不到实体，跳过
+            sub_s, sub_e, obj_s, obj_e = positions
+
             if any(p > re_cfg["max_seq_len"] - 2 for p in positions):
                 trunc_count += 1
+
+            # +1 for [CLS] token at position 0
             ids_tensor = torch.tensor([[p + 1 for p in positions]], dtype=torch.long, device=device)
+
+            # 调试输出：验证位置指向的 token 是否是实体本身
+            if pair_idx < debug_first_n:
+                marked_chars = list(marked)
+                sub_token = "".join(marked_chars[sub_s:sub_e + 1])
+                obj_token = "".join(marked_chars[obj_s:obj_e + 1])
+                print(
+                    f"  [RE 位置调试 pair#{pair_idx}] "
+                    f"sub='{sub_ent['text']}' 标记后位置[{sub_s},{sub_e}] 对应字符='{sub_token}' "
+                    f"obj='{obj_ent['text']}' 标记后位置[{obj_s},{obj_e}] 对应字符='{obj_token}'"
+                )
 
             with torch.no_grad():
                 logits = re_model(enc["input_ids"], enc["attention_mask"], enc["token_type_ids"], ids_tensor)
                 pred_id = int(torch.argmax(logits, dim=1).item())
 
             if pred_id == no_rel_id:
+                pair_idx += 1
                 continue
 
             predicate = id2rel[pred_id]
             key = (sub_ent["text"], predicate, obj_ent["text"])
             if key in seen:
+                pair_idx += 1
                 continue
             seen.add(key)
             triples.append({
@@ -129,6 +175,7 @@ def _predict_re_for_sample(
                 "subject_type": sub_ent.get("type", ""),
                 "object_type": {"@value": obj_ent.get("type", "")},
             })
+            pair_idx += 1
 
     return triples, trunc_count
 
@@ -191,8 +238,11 @@ def _evaluate(cfg: dict) -> Dict:
     sample_outputs = []
     error_counts: Dict = {}
 
+    # debug_first_n > 0 时，对前 N 条样本打印 RE 实体位置调试信息（验证 BUG-1 修复效果）
+    DEBUG_SAMPLES = 3
+
     t_start = time.perf_counter()
-    for sample in tqdm(samples, desc="pipeline_eval"):
+    for sample_idx, sample in enumerate(tqdm(samples, desc="pipeline_eval")):
         text = sample["text"]
         gold_triples = sample.get("gold_triples", [])
 
@@ -200,9 +250,16 @@ def _evaluate(cfg: dict) -> Dict:
             text, ner_model, ner_tokenizer, ner_label2txt,
             cfg["ner"]["max_length"], device
         )
+
+        # 前 DEBUG_SAMPLES 条打印 RE 位置调试信息，便于验证 BUG-1 是否已修复
+        dbg = 2 if sample_idx < DEBUG_SAMPLES else 0
+        if dbg:
+            print(f"\n[位置调试] 样本 #{sample_idx}: text='{text[:40]}...' 实体={[e['text'] for e in entities]}")
+
         pred_triples, _ = _predict_re_for_sample(
             text, entities, re_model, re_tokenizer,
-            rel2id, id2rel, cfg["re"], device
+            rel2id, id2rel, cfg["re"], device,
+            debug_first_n=dbg,
         )
 
         metrics.update(pred_triples, gold_triples)

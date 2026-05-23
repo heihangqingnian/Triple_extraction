@@ -123,44 +123,54 @@ def load_schema(schema_path: str) -> Tuple[Dict[str, int], Dict[str, int]]:
 # 共享辅助函数
 # ──────────────────────────────────────────
 
+def _find_all_positions(text: str, entity_text: str) -> List[int]:
+    """返回 entity_text 在 text 中所有出现的起始位置列表"""
+    positions = []
+    start = 0
+    while True:
+        pos = text.find(entity_text, start)
+        if pos == -1:
+            break
+        positions.append(pos)
+        start = pos + 1
+    return positions
+
+
 def _extract_entities(sample: Dict) -> List[Dict]:
-    """从样本中提取所有实体，带位置信息"""
+    """
+    从样本中提取所有实体，带位置信息。
+
+    BUG-12 fix: 原来用 text.find() 只取首次出现位置。
+    若同一实体文本在句子中多次出现，现在对每个位置分别建立记录，
+    以确保 NER 标注和 RE 数据能覆盖全部出现位置。
+    """
     text = sample.get("text", "")
     spo_list = sample.get("spo_list", [])
     seen: Set[Tuple] = set()
     entities = []
 
+    def _add_entity(entity_text: str, etype: str) -> None:
+        if not entity_text:
+            return
+        for pos in _find_all_positions(text, entity_text):
+            key = (pos, entity_text)
+            if key not in seen:
+                seen.add(key)
+                entities.append({
+                    "text": entity_text,
+                    "type": etype,
+                    "start": pos,
+                    "end": pos + len(entity_text) - 1,
+                })
+
     for spo in spo_list:
-        for entity_text, etype in [
-            (spo.get("subject", ""), spo.get("subject_type", "")),
-        ]:
-            if entity_text and entity_text in text:
-                pos = text.find(entity_text)
-                key = (pos, entity_text)
-                if key not in seen:
-                    seen.add(key)
-                    entities.append({
-                        "text": entity_text,
-                        "type": etype,
-                        "start": pos,
-                        "end": pos + len(entity_text) - 1,
-                    })
+        _add_entity(spo.get("subject", ""), spo.get("subject_type", ""))
 
         obj = spo.get("object", {})
         obj_val = obj.get("@value", "") if isinstance(obj, dict) else str(obj)
         obj_type = spo.get("object_type", {})
         obj_type_str = obj_type.get("@value", "") if isinstance(obj_type, dict) else str(obj_type)
-        if obj_val and obj_val in text:
-            pos = text.find(obj_val)
-            key = (pos, obj_val)
-            if key not in seen:
-                seen.add(key)
-                entities.append({
-                    "text": obj_val,
-                    "type": obj_type_str,
-                    "start": pos,
-                    "end": pos + len(obj_val) - 1,
-                })
+        _add_entity(obj_val, obj_type_str)
 
     return entities
 
@@ -186,6 +196,51 @@ def _sample_to_bio(sample: Dict) -> Optional[str]:
         ch_out = {"\\n": "\\n", "\t": "\\t"}.get(ch, ch)
         lines.append(f"{ch_out}\t{tag}")
     return "\n".join(lines) + "\n"
+
+
+def _get_marked_entity_positions(marked: str, sub_ent: Dict, obj_ent: Dict) -> List[int]:
+    """
+    在标记文本中查找实体的正确字符位置。
+
+    BUG-1 fix: _mark_entities 在文本中插入了 '#entity#' 和 '$entity$' 标记符，
+    导致实体在标记文本中的位置与原始文本不同。
+    原来做法：直接用原始文本坐标 + 1（[CLS] offset），指向的是 '#'/'$' 等标记符，而非实体本身。
+    修复做法：在标记文本中搜索 '#sub_text' 和 '$obj_text' 的位置，精确定位实体。
+
+    Args:
+        marked: 已插入标记符的文本（由 _mark_entities 生成）
+        sub_ent: 主语实体 dict（含 text）
+        obj_ent: 宾语实体 dict（含 text）
+
+    Returns:
+        [sub_start, sub_end, obj_start, obj_end]（字符级，0 索引，不含 [CLS] 偏移）
+    """
+    sub_marker = "#" + sub_ent["text"]
+    obj_marker = "$" + obj_ent["text"]
+
+    sub_pos = marked.find(sub_marker)
+    obj_pos = marked.find(obj_marker)
+
+    if sub_pos == -1 or obj_pos == -1:
+        logger.warning(
+            f"[BUG-1 position fix] 标记文本中找不到实体位置！"
+            f"sub='{sub_ent['text']}' obj='{obj_ent['text']}' marked='{marked[:80]}'"
+        )
+        return None
+
+    # +1: 跳过前置标记符 '#' 或 '$'，指向实体首字符
+    sub_start_m = sub_pos + 1
+    sub_end_m   = sub_start_m + len(sub_ent["text"]) - 1
+    obj_start_m = obj_pos + 1
+    obj_end_m   = obj_start_m + len(obj_ent["text"]) - 1
+
+    logger.debug(
+        f"[BUG-1 position fix] "
+        f"原始: sub=({sub_ent['start']},{sub_ent['end']}) obj=({obj_ent['start']},{obj_ent['end']})  "
+        f"标记后: sub=({sub_start_m},{sub_end_m}) obj=({obj_start_m},{obj_end_m})  "
+        f"验证: sub_text='{marked[sub_start_m:sub_end_m+1]}' obj_text='{marked[obj_start_m:obj_end_m+1]}'"
+    )
+    return [sub_start_m, sub_end_m, obj_start_m, obj_end_m]
 
 
 def _sample_to_re(sample: Dict, relation2id: Dict[str, int], neg_ratio: float = 2.0) -> List[str]:
@@ -217,9 +272,14 @@ def _sample_to_re(sample: Dict, relation2id: Dict[str, int], neg_ratio: float = 
             continue
         pos_keys.add(key)
         marked = _mark_entities(text, sub_ent, obj_ent)
-        re_lines.append(
-            f"{rel_id}\t{marked}\t{sub_ent['start']}\t{sub_ent['end']}\t{obj_ent['start']}\t{obj_ent['end']}"
-        )
+
+        # BUG-1 fix: 计算实体在标记文本中的正确位置，而非原始文本位置
+        positions = _get_marked_entity_positions(marked, sub_ent, obj_ent)
+        if positions is None:
+            continue  # 找不到则跳过，避免写入错误坐标
+
+        sub_s, sub_e, obj_s, obj_e = positions
+        re_lines.append(f"{rel_id}\t{marked}\t{sub_s}\t{sub_e}\t{obj_s}\t{obj_e}")
 
     # 负样本采样
     if pos_keys:
@@ -234,9 +294,14 @@ def _sample_to_re(sample: Dict, relation2id: Dict[str, int], neg_ratio: float = 
         n_neg = min(int(len(pos_keys) * neg_ratio), len(neg_pairs))
         for e1, e2 in random.sample(neg_pairs, n_neg):
             marked = _mark_entities(text, e1, e2)
-            re_lines.append(
-                f"{no_rel_id}\t{marked}\t{e1['start']}\t{e1['end']}\t{e2['start']}\t{e2['end']}"
-            )
+
+            # BUG-1 fix: 同样用标记文本内的真实位置
+            positions = _get_marked_entity_positions(marked, e1, e2)
+            if positions is None:
+                continue
+
+            sub_s, sub_e, obj_s, obj_e = positions
+            re_lines.append(f"{no_rel_id}\t{marked}\t{sub_s}\t{sub_e}\t{obj_s}\t{obj_e}")
 
     return re_lines
 
@@ -307,20 +372,42 @@ def format_pipeline_test(samples: List[Dict], output_file: str) -> None:
 # ──────────────────────────────────────────
 
 def _sample_to_casrel(sample: Dict, relation2id: Dict[str, int], tokenizer) -> Optional[Dict]:
-    """将样本转换为 CasRel 格式"""
+    """
+    将样本转换为 CasRel 格式。
+
+    BUG-5 fix: 添加 [CLS] 和 [SEP] 特殊 token。
+    原来: tokenizer.tokenize(text) 不含特殊 token，导致 BERT 接收的输入序列没有 [CLS]，
+          违背了 BERT 预训练设计（预训练时始终有 [CLS]）。
+    修复: 将 [CLS] 放在序列首，[SEP] 放在序列尾，实体 span 位置整体偏移 +1。
+    注意: 所有 sub_heads/sub_tails/obj_heads/obj_tails 的索引也相应 +1。
+    """
     text = sample.get("text", "")
     spo_list = sample.get("spo_list", [])
     if not text or not spo_list:
         return None
 
-    tokens = tokenizer.tokenize(text)
-    if len(tokens) > 512:
-        tokens = tokens[:512]
-    text_len = len(tokens)
+    # BUG-5 fix: 含 [CLS]/[SEP] 的完整 token 序列
+    # tokenizer.tokenize 只做分词不加特殊 token，需手动加
+    raw_tokens = tokenizer.tokenize(text)
+    max_content_len = 510  # 512 - 2（为 [CLS] 和 [SEP] 留位置）
+    if len(raw_tokens) > max_content_len:
+        raw_tokens = raw_tokens[:max_content_len]
+
+    tokens = [tokenizer.cls_token] + raw_tokens + [tokenizer.sep_token]
+    text_len = len(tokens)  # 含 [CLS] 和 [SEP]
+
     token_ids = tokenizer.convert_tokens_to_ids(tokens)
     masks = [1] * text_len
 
-    # 构建 s2ro_map
+    # 调试验证：前几个 token 应以 [CLS]（id=101）开头
+    assert tokens[0] == tokenizer.cls_token, f"[BUG-5] 首 token 应为 [CLS]，实际为 {tokens[0]}"
+    logger.debug(
+        f"[BUG-5 fix] token_ids[0:5]={token_ids[:5]} "
+        f"(期望 [CLS]=101 开头)  tokens[0]='{tokens[0]}' tokens[-1]='{tokens[-1]}'"
+    )
+
+    # 构建 s2ro_map（在含 [CLS] 的 token 序列中搜索实体位置）
+    # 实体搜索范围从 index 1 开始（跳过 [CLS]），text_len-1 结束（跳过 [SEP]）
     s2ro_map: Dict[Tuple[int, int], List[Tuple[int, int, int]]] = {}
 
     for spo in spo_list:
@@ -335,10 +422,13 @@ def _sample_to_casrel(sample: Dict, relation2id: Dict[str, int], tokenizer) -> O
             continue
         sub_toks = tokenizer.tokenize(sub_text)
         obj_toks = tokenizer.tokenize(obj_val)
-        sh = _find_head(tokens, sub_toks)
-        oh = _find_head(tokens, obj_toks)
-        if sh == -1 or oh == -1:
+        # BUG-5 fix: 在 raw_tokens（不含特殊 token）中搜索位置，然后 +1 转换到含 [CLS] 的索引
+        sh_raw = _find_head(raw_tokens, sub_toks)
+        oh_raw = _find_head(raw_tokens, obj_toks)
+        if sh_raw == -1 or oh_raw == -1:
             continue
+        sh = sh_raw + 1  # +1 因为 [CLS] 占 index 0
+        oh = oh_raw + 1
         sub_span = (sh, sh + len(sub_toks) - 1)
         obj_span = (oh, oh + len(obj_toks) - 1, rel_id)
         s2ro_map.setdefault(sub_span, []).append(obj_span)
@@ -376,7 +466,7 @@ def _sample_to_casrel(sample: Dict, relation2id: Dict[str, int], tokenizer) -> O
         "sub_tail": sub_tail_arr,
         "obj_heads": obj_heads,
         "obj_tails": obj_tails,
-        "tokens": tokens,
+        "tokens": tokens,          # 含 [CLS] 和 [SEP]，与 token_ids 对齐
         "original_spo_list": spo_list,
     }
 

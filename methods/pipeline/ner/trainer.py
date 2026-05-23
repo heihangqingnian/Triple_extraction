@@ -53,7 +53,10 @@ def _evaluate(model: BertNer, loader: DataLoader, label2txt: Dict[int, str]) -> 
     special = {"[CLS]", "[SEP]", "[PAD]"}
 
     for bert_input, batch_labels in loader:
-        logits = model(bert_input, batch_labels)[1]
+        # BUG-4 fix: 评估时不传 batch_labels，避免冗余计算 CRF loss
+        # 原来: model(bert_input, batch_labels)[1]  ← 计算并丢弃 loss，浪费算力
+        # 现在: model(bert_input)[0]               ← 直接获取 logits
+        logits = model(bert_input)[0]
         decoded = model.crf.decode(logits, mask=bert_input["attention_mask"].gt(0))
         masks = bert_input["attention_mask"].detach().cpu().tolist()
         true_ids = batch_labels.detach().cpu().tolist()
@@ -235,16 +238,18 @@ def _predict_single(
 ) -> Tuple[List[Dict], bool]:
     """对单条文本预测实体，返回 (entities, was_truncated)"""
     chars = list(text)
+    # BUG-3 fix: 使用传入的 max_length 而非硬编码 512
+    # 原来: max_length=512 且 was_truncated 判断也硬编码 510，忽略参数
     enc = tokenizer(
         chars,
         is_split_into_words=True,
         add_special_tokens=True,
-        max_length=512,
+        max_length=max_length,
         truncation=True,
         return_tensors="pt",
     )
     enc = {k: v.to(device) for k, v in enc.items()}
-    was_truncated = len(chars) > 510
+    was_truncated = len(chars) > max_length - 2  # -2 for [CLS] and [SEP]
 
     with torch.no_grad():
         logits = model(bert_input=enc)[0]
