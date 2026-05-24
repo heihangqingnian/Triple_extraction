@@ -16,6 +16,7 @@
   save_error_report     — 错误类型汇总报告
   format_comparison_table — 多方法 Markdown 对比表格
   print_per_relation_table — 按关系类型打印 P/R/F1 表格
+  parse_triple_string   — 解析模型输出字符串为三元组集合（LLM/分析脚本共用）
 """
 
 import statistics
@@ -804,3 +805,42 @@ class PerformanceMonitor:
                 torch.cuda.reset_peak_memory_stats()
         except Exception:
             pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 十二、LLM 输出解析（供 infer / evaluator / 分析脚本共用）
+# ═══════════════════════════════════════════════════════════════════════
+
+def parse_triple_string(triple_str: str) -> Set[Tuple[str, str, str]]:
+    """
+    解析模型输出的三元组字符串为集合。
+
+    支持格式：[("主体", "关系", "客体"), ...]
+    兼容单/双引号、逗号前后空格、中文标点等常见格式偏差。
+
+    Returns:
+        Set of (subject, predicate, object) tuples
+    """
+    if not triple_str:
+        return set()
+    triple_str = triple_str.strip().strip("[]")
+    if not triple_str:
+        return set()
+
+    triples: Set[Tuple[str, str, str]] = set()
+    start = 0
+    in_quote = False
+    for i, ch in enumerate(triple_str):
+        if ch == '"':
+            in_quote = not in_quote
+        elif ch == "(" and not in_quote:
+            start = i + 1
+        elif ch == ")" and not in_quote:
+            segment = triple_str[start:i].strip()
+            parts = segment.split(",")
+            if len(parts) == 3:
+                s = parts[0].strip().strip("\"'")
+                p = parts[1].strip().strip("\"'")
+                o = parts[2].strip().strip("\"'")
+                triples.add((s, p, o))
+    return triples

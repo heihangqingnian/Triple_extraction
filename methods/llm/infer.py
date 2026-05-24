@@ -2,25 +2,32 @@
 """
 ChatGLM2-6B + LoRA 推理接口
 提供 LoRA 权重加载和批量推理功能
+
+LoRA 权重配置支持两种格式（向后兼容）：
+  旧格式: lora_weights: "models/chatglm2-lora"
+  新格式: lora_weights:
+            base:   "models/chatglm2-lora-base"
+            schema: "models/chatglm2-lora-schema"
+            cot:    "models/chatglm2-lora-cot"
 """
 
-import json
 import os
-import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
 from utils.common import get_logger, set_seed
 from utils.io_utils import load_json, save_jsonl
+from utils.metrics import parse_triple_string
 
 
-def load_model(cfg: dict):
+def load_model(cfg: dict, prompt_type: str = "base"):
     """
-    加载 ChatGLM2-6B 基础模型并挂载 LoRA 权重
+    加载 ChatGLM2-6B 基础模型并挂载对应 prompt_type 的 LoRA 权重
 
     Args:
-        cfg: configs/llm.yaml 解析后的完整配置 dict
+        cfg:         configs/llm.yaml 解析后的完整配置 dict
+        prompt_type: 对应的 LoRA 变体，可选 base / schema / cot
 
     Returns:
         (model, tokenizer)
@@ -29,14 +36,18 @@ def load_model(cfg: dict):
         from peft import PeftModel
         from transformers import AutoModel, AutoTokenizer
     except ImportError:
-        raise ImportError(
-            "请安装 peft 和 transformers：pip install peft transformers"
-        )
+        raise ImportError("请安装 peft 和 transformers：pip install peft transformers")
 
     model_cfg = cfg["model"]
     base_model = model_cfg["base_model"]
-    lora_weights = model_cfg["lora_weights"]
     device_arg = model_cfg.get("device", "auto")
+
+    # 支持新格式（dict）和旧格式（str）
+    lora_cfg = model_cfg["lora_weights"]
+    if isinstance(lora_cfg, dict):
+        lora_weights = lora_cfg.get(prompt_type, "")
+    else:
+        lora_weights = lora_cfg
 
     logger = get_logger("llm_infer")
     logger.info(f"加载基础模型: {base_model}")
@@ -48,11 +59,11 @@ def load_model(cfg: dict):
         device_map=device_arg if device_arg != "cpu" else None,
     )
 
-    if os.path.exists(lora_weights):
-        logger.info(f"加载 LoRA 权重: {lora_weights}")
+    if lora_weights and os.path.exists(lora_weights):
+        logger.info(f"[{prompt_type}] 加载 LoRA 权重: {lora_weights}")
         model = PeftModel.from_pretrained(model, lora_weights)
     else:
-        logger.warning(f"LoRA 权重目录不存在: {lora_weights}，使用基础模型推理")
+        logger.warning(f"[{prompt_type}] LoRA 权重目录不存在或未配置: {lora_weights!r}，使用基础模型推理")
 
     model = model.eval()
     return model, tokenizer
@@ -64,8 +75,7 @@ def _build_prompt_base(text: str) -> str:
         "请从以下文本中抽取事实三元组。"
         "输出格式为：[(\"主体\", \"关系\", \"客体\"), ...]，如果没有符合的三元组则输出 []。"
     )
-    prompt = f"{instruction}\n\n### 文本\n{text}\n\n答："
-    return prompt
+    return f"{instruction}\n\n### 文本\n{text}\n\n答："
 
 
 def _build_prompt_with_schema(text: str) -> str:
@@ -73,7 +83,7 @@ def _build_prompt_with_schema(text: str) -> str:
     subject_types = "人物、电视综艺、娱乐人物、影视作品、企业/品牌、歌曲、图书作品、学科专业、机构、行政区、企业、文学作品、学校、国家、历史人物、景点、地点"
     object_types = "学校、人物、歌曲、音乐专辑、Date、Text、Number、气候、城市、地点、奖项、作品、语言、影视作品、企业、国家"
     schema_relations = "导演、出生地、毕业院校、嘉宾、配音、主题曲、代言人、所属专辑、父亲、作者、上映时间、母亲、专业代码、占地面积、邮政编码、票房、注册资本、主角、妻子、编剧、气候、歌手、获奖、校长、创始人、首都、丈夫、朝代、饰演、面积、总部地点、祖籍、人口数量、制片人、修业年限、所在城市、董事长、作词、改编自、出品公司、作曲、主演、主持人、成立日期、简称、海拔、号、国籍、官方语言"
-    
+
     instruction = (
         f"你是一个信息抽取专家。请从以下文本中抽取事实三元组。\n"
         f"主体实体类型只能从以下列表中选择：{subject_types}\n"
@@ -81,8 +91,7 @@ def _build_prompt_with_schema(text: str) -> str:
         f"关系类型只能从以下列表中选择：{schema_relations}\n"
         "输出格式为：[(\"主体\", \"关系\", \"客体\"), ...]，如果没有符合的三元组则输出 []。"
     )
-    prompt = f"{instruction}\n\n### 文本\n{text}\n\n答："
-    return prompt
+    return f"{instruction}\n\n### 文本\n{text}\n\n答："
 
 
 def _build_prompt_with_cot(text: str) -> str:
@@ -90,7 +99,7 @@ def _build_prompt_with_cot(text: str) -> str:
     subject_types = "人物、电视综艺、娱乐人物、影视作品、企业/品牌、歌曲、图书作品、学科专业、机构、行政区、企业、文学作品、学校、国家、历史人物、景点、地点"
     object_types = "学校、人物、歌曲、音乐专辑、Date、Text、Number、气候、城市、地点、奖项、作品、语言、影视作品、企业、国家"
     schema_relations = "导演、出生地、毕业院校、嘉宾、配音、主题曲、代言人、所属专辑、父亲、作者、上映时间、母亲、专业代码、占地面积、邮政编码、票房、注册资本、主角、妻子、编剧、气候、歌手、获奖、校长、创始人、首都、丈夫、朝代、饰演、面积、总部地点、祖籍、人口数量、制片人、修业年限、所在城市、董事长、作词、改编自、出品公司、作曲、主演、主持人、成立日期、简称、海拔、号、国籍、官方语言"
-    
+
     instruction = (
         "你是一个信息抽取专家。请按照以下步骤从文本中抽取事实三元组：\n"
         f"主体实体类型只能从以下列表中选择：{subject_types}\n"
@@ -101,8 +110,7 @@ def _build_prompt_with_cot(text: str) -> str:
         "3. 最后将符合条件的三元组以列表形式输出。\n"
         "输出格式为：[(\"主体\", \"关系\", \"客体\"), ...]，如果没有符合的三元组则输出 []。"
     )
-    prompt = f"{instruction}\n\n### 文本\n{text}\n\n答："
-    return prompt
+    return f"{instruction}\n\n### 文本\n{text}\n\n答："
 
 
 def _build_prompt(text: str, prompt_type: str = "base") -> str:
@@ -115,25 +123,32 @@ def _build_prompt(text: str, prompt_type: str = "base") -> str:
         return _build_prompt_base(text)
 
 
-def predict_sample(text: str, model, tokenizer, cfg: dict, prompt_type: str = "base") -> List[Tuple[str, str, str]]:
+def predict_sample(
+    text: str,
+    model,
+    tokenizer,
+    cfg: dict,
+    prompt_type: str = "base",
+) -> List[Tuple[str, str, str]]:
     """
     对单条文本推理，返回三元组列表
 
     Args:
-        text: 输入文本
-        model: 已加载的模型
-        tokenizer: tokenizer
-        cfg: llm 配置 dict
+        text:        输入文本
+        model:       已加载的模型
+        tokenizer:   tokenizer
+        cfg:         llm 配置 dict
         prompt_type: prompt 类型，可选值: base, schema, cot
 
     Returns:
         [(subject, predicate, object), ...]
     """
+    import torch
+
     model_cfg = cfg["model"]
     prompt = _build_prompt(text, prompt_type)
     inputs = tokenizer(prompt, return_tensors="pt")
 
-    import torch
     device = next(model.parameters()).device
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -145,63 +160,50 @@ def predict_sample(text: str, model, tokenizer, cfg: dict, prompt_type: str = "b
             do_sample=False,
         )
 
-    generated = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-    return _parse_triples(generated)
+    generated = tokenizer.decode(
+        output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+    )
+    return list(parse_triple_string(generated))
 
 
-def _parse_triples(output_str: str) -> List[Tuple[str, str, str]]:
-    """解析模型生成的三元组字符串，兼容各种格式偏差"""
-    output_str = output_str.strip().strip("[]")
-    if not output_str:
-        return []
-
-    triples = []
-    start = 0
-    in_quote = False
-    for i, ch in enumerate(output_str):
-        if ch == '"':
-            in_quote = not in_quote
-        elif ch == "(" and not in_quote:
-            start = i + 1
-        elif ch == ")" and not in_quote:
-            triple_str = output_str[start:i].strip()
-            parts = triple_str.split(",")
-            if len(parts) == 3:
-                s = parts[0].strip().strip('"\'')
-                p = parts[1].strip().strip('"\'')
-                o = parts[2].strip().strip('"\'')
-                triples.append((s, p, o))
-    return triples
+def _extract_text_from_sample(sample: dict) -> str:
+    """从 Alpaca 格式样本中提取原始文本"""
+    inp = sample.get("input", "")
+    if "### 文本\n" in inp:
+        return inp.split("### 文本\n")[-1].strip()
+    return inp.strip()
 
 
-def predict_file(cfg: dict, input_file: Optional[str] = None, output_file: Optional[str] = None) -> None:
+def predict_file(
+    cfg: dict,
+    input_file: Optional[str] = None,
+    output_file: Optional[str] = None,
+) -> None:
     """
-    批量推理：读取 Alpaca 格式 JSON 文件，逐条推理并保存预测结果
-    支持三种 Prompt 类型对比实验：base, schema, cot
+    批量推理：读取 Alpaca 格式 JSON 文件，逐条推理并保存预测结果。
+    对每种 Prompt 类型分别加载对应 LoRA 权重后推理，推理完毕后释放显存再加载下一个。
 
     Args:
-        cfg: configs/llm.yaml 配置 dict
-        input_file: 输入文件（Alpaca JSON 格式），默认使用 cfg 中的 test_file
-        output_file: 输出 JSONL 文件，默认使用 cfg 中的 predictions
+        cfg:         configs/llm.yaml 配置 dict
+        input_file:  输入文件（Alpaca JSON 格式），默认使用 cfg 中的 test_file
+        output_file: 输出 JSONL 文件前缀，默认使用 cfg 中的 output.dir
     """
+    import torch
+
     set_seed(cfg["seed"])
     logger = get_logger("llm_infer", log_file=cfg["output"]["log"])
     os.makedirs(cfg["output"]["dir"], exist_ok=True)
 
     test_file = input_file or cfg["data"]["test_file"]
-
-    logger.info(f"加载模型...")
-    model, tokenizer = load_model(cfg)
-
-    logger.info(f"开始推理: {test_file}")
+    logger.info(f"推理输入文件: {test_file}")
     samples = load_json(test_file)
 
-    prompt_types = ["base", "schema", "cot"]
-    
-    for prompt_type in prompt_types:
-        logger.info(f"=== 开始测试 Prompt 类型: {prompt_type} ===")
+    for prompt_type in ["base", "schema", "cot"]:
+        logger.info(f"=== 开始 Prompt 类型: {prompt_type} ===")
+
+        model, tokenizer = load_model(cfg, prompt_type=prompt_type)
         outputs = []
-        
+
         for sample in tqdm(samples, desc=f"llm_infer_{prompt_type}"):
             text = _extract_text_from_sample(sample)
             label_str = sample.get("output", "[]")
@@ -222,15 +224,12 @@ def predict_file(cfg: dict, input_file: Optional[str] = None, output_file: Optio
                 "label": label_str,
                 "parse_error": parse_error,
             })
-        
-        out_file = output_file or f"{cfg['output']['dir']}/predictions_{prompt_type}.jsonl"
-        save_jsonl(outputs, out_file)
-        logger.info(f"Prompt {prompt_type} 推理完成，结果已保存到: {out_file}")
 
+        out_path = output_file or f"{cfg['output']['dir']}/predictions_{prompt_type}.jsonl"
+        save_jsonl(outputs, out_path)
+        logger.info(f"Prompt {prompt_type} 推理完成 → {out_path}")
 
-def _extract_text_from_sample(sample: dict) -> str:
-    """从 Alpaca 格式样本中提取原始文本"""
-    inp = sample.get("input", "")
-    if "### 文本\n" in inp:
-        return inp.split("### 文本\n")[-1].strip()
-    return inp.strip()
+        # 推理完毕后释放显存，再加载下一个 LoRA
+        del model, tokenizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
