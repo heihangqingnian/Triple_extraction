@@ -14,15 +14,15 @@ ner:
   crf_lr: 1.0e-3
   batch_size: 16
   max_length: 128
-  epochs: 15
+  epochs: 20
   dropout: 0.1
-  patience: 10
+  patience: 5
   checkpoint: "results/pipeline_ablation1/ner_best.pt"
-  use_bilstm: false  # 消融：不使用 BiLSTM
-  use_crf: true     # 保留 CRF
+  use_bilstm: false # 消融：不使用 BiLSTM
+  use_crf: true # 保留 CRF
 
 re:
-  bert_model: "hfl/chinese-bert-wwm"
+  bert_model: "methods/pipeline/ner/model"
   bert_lr: 3.0e-5
   other_lr: 3.0e-4
   train_batch_size: 32
@@ -39,3 +39,4 @@ output:
   metrics: "results/pipeline_ablation1/metrics.json"
   error_report: "results/pipeline_ablation1/error_report.txt"
   log: "results/pipeline_ablation1/train.log"
+  ablation_dir: "results/pipeline_ablation1"

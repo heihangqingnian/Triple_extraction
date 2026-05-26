@@ -34,7 +34,7 @@ ner:
 
 re:
   # BERT 预训练模型路径或 HuggingFace 模型名
-  bert_model: "hfl/chinese-bert-wwm"
+  bert_model: "methods/pipeline/ner/model"
   # BERT 层学习率
   bert_lr: 3.0e-5
   # 非 BERT 层（线性头）学习率（暂未差分，保留备用）
