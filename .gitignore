@@ -62,3 +62,7 @@ scripts/smoke_test.py
 
 results_old/
 scripts/ablation_smoke_test.py
+scripts/generate_new_prompt.py
+scripts/generate_prompt_data.py
+train_re_only.py
+PAPER.md

@@ -389,7 +389,9 @@ def evaluate(cfg: dict) -> Dict:
     data_cfg  = cfg["data"]
     out_dir   = cfg["output"]["dir"]
     os.makedirs(out_dir, exist_ok=True)
-    logger = get_logger("joint_eval", log_file=cfg["output"]["log"])
+    # 评估日志单独记录到 eval.log
+    eval_log_path = os.path.join(out_dir, "eval.log")
+    logger = get_logger("joint_eval", log_file=eval_log_path)
 
     # 消融：读取消融参数
     use_subject_feedback = model_cfg.get("use_subject_feedback", True)
