@@ -66,3 +66,4 @@ scripts/generate_new_prompt.py
 scripts/generate_prompt_data.py
 train_re_only.py
 PAPER.md
+result_temp/

@@ -6,6 +6,8 @@ Usage::
 
     # Pipeline 方法
     python main.py --method pipeline --mode train
+    python main.py --method pipeline --mode train --component re   # 单独训练 RE 模型
+    python main.py --method pipeline --mode train --component ner  # 单独训练 NER 模型
     python main.py --method pipeline --mode evaluate
     python main.py --method pipeline --mode predict --input data/processed/pipeline/test/pipeline_test.jsonl
 
@@ -81,6 +83,12 @@ def parse_args():
         help="自定义配置文件路径（可选，默认使用 configs/<method>.yaml）",
     )
     parser.add_argument(
+        "--component",
+        default=None,
+        choices=["ner", "re"],
+        help="pipeline train 模式下只训练指定子模型（ner / re），省略则顺序训练 NER→RE",
+    )
+    parser.add_argument(
         "--input",
         default=None,
         help="predict 或 evaluate 模式下的输入文件路径",
@@ -106,9 +114,18 @@ def load_config(method: str, config_path: str = None) -> dict:
     return load_yaml(str(path))
 
 
-def run_pipeline(cfg: dict, mode: str, input_path: str = None, output_path: str = None):
-    from methods.pipeline.pipeline import run
-    run(cfg, mode, input_path=input_path, output_path=output_path)
+def run_pipeline(cfg: dict, mode: str, input_path: str = None, output_path: str = None, component: str = None):
+    if mode == "train" and component == "re":
+        from methods.pipeline.re.trainer import train as re_train
+        print("=== 单独训练 RE 模型 ===")
+        re_train(cfg)
+    elif mode == "train" and component == "ner":
+        from methods.pipeline.ner.trainer import train as ner_train
+        print("=== 单独训练 NER 模型 ===")
+        ner_train(cfg)
+    else:
+        from methods.pipeline.pipeline import run
+        run(cfg, mode, input_path=input_path, output_path=output_path)
 
 
 def run_joint(cfg: dict, mode: str, input_path: str = None, output_path: str = None):
@@ -160,7 +177,7 @@ def main():
 
     # 路由到对应方法
     if args.method == "pipeline":
-        run_pipeline(cfg, args.mode, input_path=args.input, output_path=args.output)
+        run_pipeline(cfg, args.mode, input_path=args.input, output_path=args.output, component=args.component)
 
     elif args.method == "joint":
         run_joint(cfg, args.mode, input_path=args.input, output_path=args.output)

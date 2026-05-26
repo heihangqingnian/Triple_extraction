@@ -99,11 +99,18 @@ data/processed/
 ### 3.1 训练
 
 ```bash
-# 完整训练（NER 阶段 + RE 阶段，含早停）
+# 完整训练（NER 阶段 → RE 阶段，含早停）
 python main.py --method pipeline --mode train
 
-# 自定义配置
+# 单独训练 RE 模型（NER 权重已存在时使用，等价于 train_re_only.py）
+python main.py --method pipeline --mode train --component re
+
+# 单独训练 NER 模型
+python main.py --method pipeline --mode train --component ner
+
+# 自定义配置（--component 与 --config 可组合使用）
 python main.py --method pipeline --mode train --config configs/pipeline.yaml
+python main.py --method pipeline --mode train --component re --config configs/ablation_pipeline_1_no_bilstm.yaml
 ```
 
 训练产出：
@@ -259,6 +266,16 @@ python main.py --method pipeline --mode evaluate --config configs/ablation_pipel
 # 消融 2：去除 CRF（BERT-Linear）
 python main.py --method pipeline --mode train    --config configs/ablation_pipeline_2_no_crf.yaml
 python main.py --method pipeline --mode evaluate --config configs/ablation_pipeline_2_no_crf.yaml
+```
+
+`--component` 可与消融配置组合使用，适合 NER/RE 任一阶段已完成、只需重跑另一阶段的场景：
+
+```bash
+# 仅重训消融 1 的 RE 部分（NER 权重已存在）
+python main.py --method pipeline --mode train --component re --config configs/ablation_pipeline_1_no_bilstm.yaml
+
+# 仅重训消融 2 的 NER 部分
+python main.py --method pipeline --mode train --component ner --config configs/ablation_pipeline_2_no_crf.yaml
 ```
 
 ### Joint 消融

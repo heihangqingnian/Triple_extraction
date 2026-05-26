@@ -21,16 +21,16 @@ ner:
   crf_lr: 1.0e-3
   batch_size: 16
   max_length: 128
-  epochs: 15
+  epochs: 20
   dropout: 0.1
   # 早停耐心值
-  patience: 10
+  patience: 5
   # 最佳模型保存路径
   checkpoint: "results/pipeline/ner_best.pt"
 
   # 消融实验参数
-  use_bilstm: true      # 是否使用 BiLSTM 层（false = BERT-CRF）
-  use_crf: true         # 是否使用 CRF 层（false = BERT-Linear/Softmax）
+  use_bilstm: true # 是否使用 BiLSTM 层（false = BERT-CRF）
+  use_crf: true # 是否使用 CRF 层（false = BERT-Linear/Softmax）
 
 re:
   # BERT 预训练模型路径或 HuggingFace 模型名
