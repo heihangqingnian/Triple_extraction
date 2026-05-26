@@ -290,7 +290,9 @@ def _extract_triples_from_batch(
 
     pred_triples: List[Tuple] = []
     if subjects:
-        rep_enc = encoded.repeat(len(subjects), 1, 1)
+        # 双编码器模式下宾语预测使用独立编码器，与训练保持一致
+        encoded_obj = model.get_encoded_text(token_ids, mask, for_object=True)
+        rep_enc = encoded_obj.repeat(len(subjects), 1, 1)
         sh_map = torch.zeros(len(subjects), 1, encoded.size(1))
         st_map = torch.zeros(len(subjects), 1, encoded.size(1))
         for i, (sh, st) in enumerate(subjects):

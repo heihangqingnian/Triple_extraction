@@ -116,20 +116,3 @@ class Casrel(nn.Module):
         )
         return pred_sub_heads, pred_sub_tails, pred_obj_heads, pred_obj_tails
 
-    def get_encoded_text_for_eval(self, token_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        评估时获取编码文本（双编码器模式下返回两个编码）
-
-        Args:
-            token_ids: [B, L]
-            mask: [B, L]
-
-        Returns:
-            (encoded_text_sub, encoded_text_obj) 或 单个 encoded_text
-        """
-        if self.dual_encoder:
-            return (
-                self.bert_encoder(token_ids, attention_mask=mask)[0],
-                self.bert_encoder_obj(token_ids, attention_mask=mask)[0],
-            )
-        return self.bert_encoder(token_ids, attention_mask=mask)[0]

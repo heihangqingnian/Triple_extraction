@@ -371,23 +371,26 @@ def format_pipeline_test(samples: List[Dict], output_file: str) -> None:
 # Joint 格式：CasRel JSONL
 # ──────────────────────────────────────────
 
-def _sample_to_casrel(sample: Dict, relation2id: Dict[str, int], tokenizer) -> Optional[Dict]:
+def _sample_to_casrel(sample: Dict, relation2id: Dict[str, int], tokenizer) -> List[Dict]:
     """
-    将样本转换为 CasRel 格式。
+    将样本转换为 CasRel 格式，每个 ground-truth 主语生成一条独立训练样本。
 
     BUG-5 fix: 添加 [CLS] 和 [SEP] 特殊 token。
     原来: tokenizer.tokenize(text) 不含特殊 token，导致 BERT 接收的输入序列没有 [CLS]，
           违背了 BERT 预训练设计（预训练时始终有 [CLS]）。
     修复: 将 [CLS] 放在序列首，[SEP] 放在序列尾，实体 span 位置整体偏移 +1。
     注意: 所有 sub_heads/sub_tails/obj_heads/obj_tails 的索引也相应 +1。
+
+    论文对齐 fix: 原来对有 N 个主语的句子只随机选 1 个主语固化到磁盘，
+    导致宾语预测器只学到 1/N 的三元组，其余 (N-1)/N 从未被训练。
+    现在每个 (句子, 主语) 生成一条样本，完整覆盖所有三元组。
     """
     text = sample.get("text", "")
     spo_list = sample.get("spo_list", [])
     if not text or not spo_list:
-        return None
+        return []
 
     # BUG-5 fix: 含 [CLS]/[SEP] 的完整 token 序列
-    # tokenizer.tokenize 只做分词不加特殊 token，需手动加
     raw_tokens = tokenizer.tokenize(text)
     max_content_len = 510  # 512 - 2（为 [CLS] 和 [SEP] 留位置）
     if len(raw_tokens) > max_content_len:
@@ -399,15 +402,9 @@ def _sample_to_casrel(sample: Dict, relation2id: Dict[str, int], tokenizer) -> O
     token_ids = tokenizer.convert_tokens_to_ids(tokens)
     masks = [1] * text_len
 
-    # 调试验证：前几个 token 应以 [CLS]（id=101）开头
     assert tokens[0] == tokenizer.cls_token, f"[BUG-5] 首 token 应为 [CLS]，实际为 {tokens[0]}"
-    logger.debug(
-        f"[BUG-5 fix] token_ids[0:5]={token_ids[:5]} "
-        f"(期望 [CLS]=101 开头)  tokens[0]='{tokens[0]}' tokens[-1]='{tokens[-1]}'"
-    )
 
     # 构建 s2ro_map（在含 [CLS] 的 token 序列中搜索实体位置）
-    # 实体搜索范围从 index 1 开始（跳过 [CLS]），text_len-1 结束（跳过 [SEP]）
     s2ro_map: Dict[Tuple[int, int], List[Tuple[int, int, int]]] = {}
 
     for spo in spo_list:
@@ -422,7 +419,9 @@ def _sample_to_casrel(sample: Dict, relation2id: Dict[str, int], tokenizer) -> O
             continue
         sub_toks = tokenizer.tokenize(sub_text)
         obj_toks = tokenizer.tokenize(obj_val)
-        # BUG-5 fix: 在 raw_tokens（不含特殊 token）中搜索位置，然后 +1 转换到含 [CLS] 的索引
+        if not sub_toks or not obj_toks:
+            continue
+        # BUG-5 fix: 在 raw_tokens 中搜索位置，然后 +1 转换到含 [CLS] 的索引
         sh_raw = _find_head(raw_tokens, sub_toks)
         oh_raw = _find_head(raw_tokens, obj_toks)
         if sh_raw == -1 or oh_raw == -1:
@@ -434,44 +433,52 @@ def _sample_to_casrel(sample: Dict, relation2id: Dict[str, int], tokenizer) -> O
         s2ro_map.setdefault(sub_span, []).append(obj_span)
 
     if not s2ro_map:
-        return None
+        return []
 
+    # sub_heads/sub_tails 标注句中所有主语（供主语预测器训练）
     sub_heads_arr = [0] * text_len
     sub_tails_arr = [0] * text_len
     for sh, st in s2ro_map:
         sub_heads_arr[sh] = 1
         sub_tails_arr[st] = 1
 
-    sh_idx, st_idx = random.choice(list(s2ro_map.keys()))
-    sub_head_arr = [0] * text_len
-    sub_tail_arr = [0] * text_len
-    sub_head_arr[sh_idx] = 1
-    sub_tail_arr[st_idx] = 1
-
     rel_num = len(relation2id)
-    obj_heads = [[0] * rel_num for _ in range(text_len)]
-    obj_tails = [[0] * rel_num for _ in range(text_len)]
-    for oh, ot, rid in s2ro_map.get((sh_idx, st_idx), []):
-        if oh < text_len and ot < text_len:
-            obj_heads[oh][rid] = 1
-            obj_tails[ot][rid] = 1
+    results = []
 
-    return {
-        "token_ids": token_ids,
-        "masks": masks,
-        "text_len": text_len,
-        "sub_heads": sub_heads_arr,
-        "sub_tails": sub_tails_arr,
-        "sub_head": sub_head_arr,
-        "sub_tail": sub_tail_arr,
-        "obj_heads": obj_heads,
-        "obj_tails": obj_tails,
-        "tokens": tokens,          # 含 [CLS] 和 [SEP]，与 token_ids 对齐
-        "original_spo_list": spo_list,
-    }
+    # 每个 ground-truth 主语生成一条独立样本，确保所有三元组都被宾语预测器训练到
+    for sh_idx, st_idx in s2ro_map.keys():
+        sub_head_arr = [0] * text_len
+        sub_tail_arr = [0] * text_len
+        sub_head_arr[sh_idx] = 1
+        sub_tail_arr[st_idx] = 1
+
+        obj_heads = [[0] * rel_num for _ in range(text_len)]
+        obj_tails = [[0] * rel_num for _ in range(text_len)]
+        for oh, ot, rid in s2ro_map[(sh_idx, st_idx)]:
+            if oh < text_len and ot < text_len:
+                obj_heads[oh][rid] = 1
+                obj_tails[ot][rid] = 1
+
+        results.append({
+            "token_ids": token_ids,
+            "masks": masks,
+            "text_len": text_len,
+            "sub_heads": sub_heads_arr,
+            "sub_tails": sub_tails_arr,
+            "sub_head": sub_head_arr,
+            "sub_tail": sub_tail_arr,
+            "obj_heads": obj_heads,
+            "obj_tails": obj_tails,
+            "tokens": tokens,
+            "original_spo_list": spo_list,
+        })
+
+    return results
 
 
 def _find_head(source: List[str], target: List[str]) -> int:
+    if not target:
+        return -1
     tl = len(target)
     for i in range(len(source) - tl + 1):
         if source[i: i + tl] == target:
@@ -493,17 +500,27 @@ def format_joint(
     tokenizer = BertTokenizer.from_pretrained(bert_model)
     out_file = os.path.join(output_dir, f"{split}.json")
 
+    # CasRel 不需要"无关系"类（没有宾语时直接输出全 0，不需要独立类别）
+    # 过滤后 ID 仍连续（"无关系"始终被追加在末尾）
+    joint_rel2id = {k: v for k, v in relation2id.items() if k != "无关系"}
+
     converted = 0
     with open(out_file, "w", encoding="utf-8") as f:
         for sample in samples:
-            casrel = _sample_to_casrel(sample, relation2id, tokenizer)
-            if casrel is None:
+            casrel_list = _sample_to_casrel(sample, joint_rel2id, tokenizer)
+            if not casrel_list:
                 continue
-            # s2ro_map 中元组键无法直接序列化，忽略该字段
-            f.write(json.dumps(casrel, ensure_ascii=False) + "\n")
-            converted += 1
+            if split == "train":
+                # 训练集：每个主语一条样本，完整覆盖所有三元组的宾语预测
+                for casrel in casrel_list:
+                    f.write(json.dumps(casrel, ensure_ascii=False) + "\n")
+                    converted += 1
+            else:
+                # dev/test：每句只写一条（推理不使用 sub_head/sub_tail，重复样本无意义）
+                f.write(json.dumps(casrel_list[0], ensure_ascii=False) + "\n")
+                converted += 1
 
-    logger.info(f"Joint 数据已保存: {out_file} ({converted}/{len(samples)} 条)")
+    logger.info(f"Joint 数据已保存: {out_file} ({converted} 条，原始 {len(samples)} 句)")
 
 
 # ──────────────────────────────────────────
@@ -654,7 +671,8 @@ def main():
         joint_dir = os.path.join(output_dir, "joint")
         for split_name, samples in splits.items():
             format_joint(samples, os.path.join(joint_dir, split_name), split_name, relation2id, args.bert_model)
-        save_json(relation2id, os.path.join(joint_dir, "rel2id.json"))
+        joint_rel2id = {k: v for k, v in relation2id.items() if k != "无关系"}
+        save_json(joint_rel2id, os.path.join(joint_dir, "rel2id.json"))
         logger.info("Joint 数据生成完成")
 
     # LLM

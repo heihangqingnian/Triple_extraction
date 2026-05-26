@@ -7,7 +7,7 @@ data:
   # 预处理后数据目录（由 scripts/preprocess.py 生成）
   processed_dir: "data/processed/joint"
   # 关系映射文件
-  rel2id: "data/processed/shared/rel2id.json"
+  rel2id: "data/processed/joint/rel2id.json"
   # 数据集分割前缀
   train_prefix: "train"
   dev_prefix: "dev"
@@ -40,10 +40,10 @@ model:
   checkpoint: "results/joint/best.pt"
 
   # 消融实验参数
-  use_subject_feedback: true  # 是否使用主实体条件反馈（false = 移除级联机制）
-  dual_encoder: false          # 是否使用双独立编码器（true = 主语和宾语各一个 BERT）
-  loss_alpha: 1.0              # 主语损失权重（L_subject）
-  loss_beta: 1.0               # 宾语-关系损失权重（L_object_relation）
+  use_subject_feedback: true # 是否使用主实体条件反馈（false = 移除级联机制）
+  dual_encoder: false # 是否使用双独立编码器（true = 主语和宾语各一个 BERT）
+  loss_alpha: 1.0 # 主语损失权重（L_subject）
+  loss_beta: 1.0 # 宾语-关系损失权重（L_object_relation）
 
 output:
   dir: "results/joint"
