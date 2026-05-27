@@ -1,0 +1,26 @@
+# LLM 方法配置 - CoT LoRA 变体
+# 对应训练策略：Chain-of-Thought（先识别实体，再判断关系，最后输出三元组）
+# 使用方法：
+#   python main.py --method llm --mode predict  --config configs/llm_cot.yaml
+#   python main.py --method llm --mode evaluate --config configs/llm_cot.yaml
+
+seed: 42
+
+model:
+  base_model: "ZhipuAI/chatglm2-6b"
+  lora_weights: "models/chatglm2-lora-cot"
+  prompt_type: "cot"
+  max_new_tokens: 512
+  temperature: 0.1
+  device: "auto"
+
+data:
+  test_file: "data/processed/llm/test_cot.json"
+  predictions_file: "results/llm/cot/predictions_cot.jsonl"
+
+output:
+  dir: "results/llm/cot"
+  predictions: "results/llm/cot/predictions_cot.jsonl"
+  metrics: "results/llm/cot/metrics_cot.json"
+  error_report: "results/llm/cot/error_report_cot.txt"
+  log: "results/llm/cot/infer_cot.log"

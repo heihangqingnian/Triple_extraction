@@ -87,9 +87,13 @@ data/processed/
 │   ├── dev/dev.json
 │   └── test/test.json
 └── llm/
-    ├── train_base.json, train_schema.json, train_cot.json   # Alpaca 格式
-    ├── dev_*.json
-    └── test.json
+    ├── train_base.json     # 三种变体的 Alpaca 格式训练集（用于 LlamaFactory 微调）
+    ├── train_schema.json
+    ├── train_cot.json
+    ├── dev_{base,schema,cot}.json   # 验证集（三种格式）
+    ├── test_base.json      # 测试集（三种格式），推理时直接从文件读取 prompt
+    ├── test_schema.json    # instruction 字段与训练数据完全一致，无需代码动态拼接
+    └── test_cot.json
 ```
 
 ---
@@ -114,9 +118,10 @@ python main.py --method pipeline --mode train --component re --config configs/ab
 ```
 
 训练产出：
-- `results/pipeline/ner_best.pt`  — NER 最优模型权重
-- `results/pipeline/re_best.pt`   — RE 最优模型权重
-- `results/pipeline/train.log`    — 训练日志
+
+- `results/pipeline/ner_best.pt` — NER 最优模型权重
+- `results/pipeline/re_best.pt` — RE 最优模型权重
+- `results/pipeline/train.log` — 训练日志
 
 ### 3.2 评估
 
@@ -126,11 +131,12 @@ python main.py --method pipeline --mode evaluate
 ```
 
 评估产出（`results/pipeline/`）：
-- `metrics.json`      — 整体 P/R/F1
+
+- `metrics.json` — 整体 P/R/F1
 - `predictions.jsonl` — 每条样本的预测结果（含 `text/pred_triples/gold_triples`）
-- `error_report.txt`  — 九类错误统计
-- `error_cases.txt`   — 错误样本详情（最多 200 条）
-- `per_relation.txt`  — 49 类关系的逐类 P/R/F1
+- `error_report.txt` — 九类错误统计
+- `error_cases.txt` — 错误样本详情（最多 200 条）
+- `per_relation.txt` — 49 类关系的逐类 P/R/F1
 
 ### 3.3 推理（自定义输入）
 
@@ -153,8 +159,9 @@ python main.py --method joint --mode train
 ```
 
 训练产出：
-- `results/joint/best.pt`    — 最优模型权重
-- `results/joint/train.log`  — 训练日志
+
+- `results/joint/best.pt` — 最优模型权重
+- `results/joint/train.log` — 训练日志
 
 ### 4.2 评估
 
@@ -163,6 +170,7 @@ python main.py --method joint --mode evaluate
 ```
 
 评估产出（`results/joint/`）：
+
 - `metrics.json`, `predictions.jsonl`, `error_report.txt`, `error_cases.txt`, `per_relation.txt`
 
 ### 4.3 推理
@@ -178,56 +186,81 @@ python main.py --method joint --mode predict \
 
 LLM 方法分为两个阶段：**LoRA 微调**（通过 LlamaFactory）和**推理评估**（本仓库）。
 
+三个 LoRA 变体对应三种 Prompt 策略，分别有独立配置文件：
+
+| 变体   | 配置文件                  | LoRA 权重路径                  | Prompt 策略                   |
+| ------ | ------------------------- | ------------------------------ | ----------------------------- |
+| base   | `configs/llm_base.yaml`   | `models/chatglm2-lora-base/`   | 基础指令，无约束              |
+| schema | `configs/llm_schema.yaml` | `models/chatglm2-lora-schema/` | 加入 Schema 实体/关系类型约束 |
+| cot    | `configs/llm_cot.yaml`    | `models/chatglm2-lora-cot/`    | Chain-of-Thought 分步推理     |
+
 ### 5.1 LoRA 微调（外部 LlamaFactory）
-
-三种 LoRA 变体对应三种 Prompt 策略：
-
-| 变体 | 训练数据 | 保存路径 |
-|------|---------|---------|
-| base   | `data/processed/llm/train_base.json`   | `models/chatglm2-lora-base/`   |
-| schema | `data/processed/llm/train_schema.json` | `models/chatglm2-lora-schema/` |
-| cot    | `data/processed/llm/train_cot.json`    | `models/chatglm2-lora-cot/`    |
-
-使用 LlamaFactory 训练示例（以 base 变体为例）：
 
 ```bash
 # 安装 LlamaFactory
 pip install llamafactory
 
-# 训练 base LoRA
+# 训练 base LoRA（以 base 为例，schema/cot 同理，替换 output_dir 和 prompt 格式）
 llamafactory-cli train \
-    --model_name_or_path models/chatglm2-6b \
+    --model_name_or_path ZhipuAI/chatglm2-6b \
     --finetuning_type lora \
-    --dataset data/processed/llm/train_base.json \
+    --dataset data/processed/llm/train.json \
     --dataset_dir . \
     --output_dir models/chatglm2-lora-base \
     --num_train_epochs 3 \
     --per_device_train_batch_size 4 \
     --learning_rate 2e-4 \
     --lora_rank 8
-
-# 同理训练 schema 和 cot 变体（替换 dataset 和 output_dir）
 ```
 
 若暂无 LoRA 权重，推理将自动回退到基础模型（日志中会提示 Warning）。
 
-### 5.2 推理（三种 Prompt + 三套 LoRA）
+### 5.2 推理
+
+**方式一（推荐）：使用各变体独立配置文件**
+
+每个配置文件指定对应的 LoRA 路径、Prompt 类型和结果输出目录，互不干扰：
 
 ```bash
-# 依次对 base/schema/cot 三种 Prompt 进行推理
-# 每种 Prompt 加载对应 LoRA 权重，推理完毕后释放显存再加载下一个
-python main.py --method llm --mode predict
+# base 变体：结果保存到 results/llm/base/
+python main.py --method llm --mode predict --config configs/llm_base.yaml
+
+# schema 变体：结果保存到 results/llm/schema/
+python main.py --method llm --mode predict --config configs/llm_schema.yaml
+
+# cot 变体：结果保存到 results/llm/cot/
+python main.py --method llm --mode predict --config configs/llm_cot.yaml
 ```
 
-推理产出（`results/llm/`）：
-- `predictions_base.jsonl`   — base prompt 预测结果
-- `predictions_schema.jsonl` — schema-constrained prompt 预测结果
-- `predictions_cot.jsonl`    — chain-of-thought prompt 预测结果
+**方式二：使用主配置 + `--variant` 参数**
+
+```bash
+# 一次性对全部三个变体推理（按顺序加载 LoRA，完成后释放显存）
+python main.py --method llm --mode predict
+
+# 只推理指定变体
+python main.py --method llm --mode predict --variant base
+python main.py --method llm --mode predict --variant schema
+python main.py --method llm --mode predict --variant cot
+```
+
+推理产出（方式一，各变体独立目录）：
+
+```
+results/llm/
+├── base/
+│   └── predictions_base.jsonl
+├── schema/
+│   └── predictions_schema.jsonl
+└── cot/
+    └── predictions_cot.jsonl
+```
 
 每条记录格式：
+
 ```json
 {
-  "prompt_type": "cot",
+  "prompt_type": "base",
   "prompt": "...",
   "text": "原始文本",
   "predict": "[('主体', '关系', '客体'), ...]",
@@ -238,19 +271,43 @@ python main.py --method llm --mode predict
 
 ### 5.3 评估
 
-```bash
-# 同时评估全部三种 Prompt 类型，汇总写入 metrics.json
-python main.py --method llm --mode evaluate
+**方式一（推荐）：使用各变体独立配置文件**
 
-# 仅评估某一类型（需已完成推理）
-# evaluate() 内部可按 prompt_type 筛选（见 methods/llm/evaluator.py）
+```bash
+# base 变体：指标保存到 results/llm/base/metrics_base.json
+python main.py --method llm --mode evaluate --config configs/llm_base.yaml
+
+# schema 变体
+python main.py --method llm --mode evaluate --config configs/llm_schema.yaml
+
+# cot 变体
+python main.py --method llm --mode evaluate --config configs/llm_cot.yaml
+
+# 指定已有预测文件（--input 仅在单变体时生效）
+python main.py --method llm --mode evaluate --config configs/llm_base.yaml \
+    --input results/llm/base/predictions_base.jsonl
 ```
 
-评估产出（`results/llm/`）：
-- `metrics.json`                — 三种 Prompt 的 P/R/F1 汇总
-- `error_report_base.txt`       — base prompt 错误报告
-- `error_report_schema.txt`
-- `error_report_cot.txt`
+**方式二：使用主配置**
+
+```bash
+# 同时评估全部三种变体，汇总写入 results/llm/metrics.json
+python main.py --method llm --mode evaluate
+
+# 只评估指定变体
+python main.py --method llm --mode evaluate --variant base
+python main.py --method llm --mode evaluate --variant schema
+python main.py --method llm --mode evaluate --variant cot
+```
+
+评估产出（方式一，以 base 为例）：
+
+```
+results/llm/base/
+├── predictions_base.jsonl     — 推理结果
+├── metrics_base.json          — P/R/F1 指标
+└── error_report_base.txt      — 错误类型统计
+```
 
 ---
 
@@ -333,6 +390,7 @@ EPO           210    0.5820    0.6410    0.4210      0.5010    0.5630
 ```
 
 **分类定义**：
+
 - **Normal**：句中所有三元组之间无任何实体共享
 - **SEO**（SingleEntityOverlap）：至少一个实体（主体或客体）出现在多个三元组中，且无 EPO
 - **EPO**（EntityPairOverlap）：同一实体对（主体+客体）以不同谓词出现在多个三元组中
@@ -350,6 +408,7 @@ python scripts/density_eval.py \
 ```
 
 输出包含两部分：
+
 1. 按三元组密度（1 / 2-3 / 4+）分桶的各方法 F1 对比表
 2. LLM 在 ≥5 个三元组的长句上的专项分析（recall、截断比例、遗忘信号）
 
@@ -374,6 +433,7 @@ python scripts/low_resource_eval.py --methods llm --data_only
 ```
 
 采样数据目录：
+
 ```
 data/processed/low_resource/
 ├── 1pct/
@@ -385,6 +445,7 @@ data/processed/low_resource/
 ```
 
 结果目录：
+
 ```
 results/low_resource/
 ├── 1pct/pipeline/metrics.json
@@ -424,7 +485,10 @@ Research1/
 ├── configs/                    # YAML 超参数配置
 │   ├── pipeline.yaml
 │   ├── joint.yaml
-│   ├── llm.yaml                # 三路 LoRA 权重配置
+│   ├── llm.yaml                # LLM 主配置（三路 LoRA 权重，--variant 控制）
+│   ├── llm_base.yaml           # base LoRA 独立配置（推荐单独使用）
+│   ├── llm_schema.yaml         # schema LoRA 独立配置
+│   ├── llm_cot.yaml            # cot LoRA 独立配置
 │   └── ablation_*.yaml
 │
 ├── methods/
@@ -461,6 +525,9 @@ Research1/
     ├── pipeline/
     ├── joint/
     ├── llm/
+    │   ├── base/               # base LoRA 推理/评估结果
+    │   ├── schema/             # schema LoRA 推理/评估结果
+    │   └── cot/                # cot LoRA 推理/评估结果
     └── low_resource/
 ```
 
@@ -469,17 +536,28 @@ Research1/
 ## 常见问题
 
 **Q: CUDA 内存不足（OOM）**
+
 - 减小 `batch_size`（configs/joint.yaml 或 pipeline.yaml）
 - LLM 推理时设置 `device: cpu`（速度慢但无 OOM）
 - 确保每次只加载一套 LoRA 权重（infer.py 已自动释放）
 
 **Q: LoRA 权重不存在**
+
 - 推理会自动回退到基础模型，观察日志中 `Warning: LoRA 权重目录不存在`
 - 基础模型推理效果通常低于微调后的模型
 
 **Q: fine_grained_eval.py 或 density_eval.py 报"未找到预测文件"**
+
 - 请先运行各方法的 evaluate 步骤生成 `predictions.jsonl`
 - LLM 需要先运行 `--mode predict` 再运行 `--mode evaluate`
+- LLM 三个变体需分别运行（使用 `configs/llm_base.yaml` / `llm_schema.yaml` / `llm_cot.yaml`）
+
+**Q: LLM 推理/评估如何选择配置文件？**
+
+- 推荐为每个变体使用独立配置文件（`configs/llm_*.yaml`），结果自动保存到独立目录
+- 需要一次性跑全部三个变体时，使用主配置 `configs/llm.yaml`（不加 `--variant`）
+- `--variant` 参数可以在任意配置文件基础上强制覆盖 prompt 类型
 
 **Q: low_resource_eval.py 提示训练文件不存在**
+
 - 请先运行 `python scripts/preprocess.py --method all` 完成预处理

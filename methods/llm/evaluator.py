@@ -131,17 +131,41 @@ def _print_summary(all_results: Dict) -> None:
     print("=" * 58)
 
 
-def run(cfg: dict, mode: str, input_path: Optional[str] = None, output_path: Optional[str] = None) -> None:
-    """LLM 方法统一入口"""
+def run(
+    cfg: dict,
+    mode: str,
+    input_path: Optional[str] = None,
+    output_path: Optional[str] = None,
+    variant: str = "all",
+) -> None:
+    """
+    LLM 方法统一入口
+
+    Args:
+        cfg:         configs/llm.yaml 配置 dict
+        mode:        train / predict / evaluate
+        input_path:  predict 时为输入文件；evaluate 时为指定预测文件（仅 variant 非 all 时生效）
+        output_path: predict 时为输出文件（单变体）或忽略（all）；evaluate 时为输出目录
+        variant:     LoRA 变体 base/schema/cot/all（默认 all）
+    """
     from utils.common import set_seed
     set_seed(cfg["seed"])
 
     if mode == "predict":
         from methods.llm.infer import predict_file
-        predict_file(cfg, input_file=input_path, output_file=output_path)
+        predict_file(cfg, input_file=input_path, output_file=output_path, variant=variant)
 
     elif mode == "evaluate":
-        evaluate(cfg, predictions_file=input_path, output_dir=output_path)
+        # 优先级：命令行 --variant > config 中 model.prompt_type > 全部运行
+        cfg_prompt_type = cfg.get("model", {}).get("prompt_type")
+        if variant != "all":
+            prompt_type = variant
+        elif cfg_prompt_type:
+            prompt_type = cfg_prompt_type
+        else:
+            prompt_type = None  # evaluate all
+        pred_file = input_path if prompt_type is not None else None
+        evaluate(cfg, prompt_type=prompt_type, predictions_file=pred_file, output_dir=output_path)
 
     elif mode == "train":
         print(

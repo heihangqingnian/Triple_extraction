@@ -19,9 +19,13 @@ model:
   device: "auto"
 
 data:
-  # 推理输入文件（Alpaca 格式 JSON）
+  # 各变体对应的测试文件（由 preprocess.py 生成，格式与训练数据一致）
+  test_files:
+    base:   "data/processed/llm/test_base.json"
+    schema: "data/processed/llm/test_schema.json"
+    cot:    "data/processed/llm/test_cot.json"
+  # 兜底默认值（单独运行 --variant base 且无 test_files 时使用）
   test_file: "data/processed/llm/test_base.json"
-  # 现有预测结果文件（单类型评估时使用）
   predictions_file: "results/llm/predictions.jsonl"
 
 output:

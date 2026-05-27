@@ -20,7 +20,7 @@ Usage::
     # 只转换 joint 格式
     python scripts/preprocess.py --input data/raw/DuIE2.0 --method joint
 
-    # 只转换 llm 格式
+    # 只转换 llm 格式（此方法已过时，不再使用）
     python scripts/preprocess.py --input data/raw/DuIE2.0 --method llm
 
 数据集目录结构（DuIE2.0 原始格式）::
@@ -527,26 +527,55 @@ def format_joint(
 # LLM 格式：Alpaca JSON
 # ──────────────────────────────────────────
 
-ALPACA_INSTRUCTION = (
-    "你是一个信息抽取专家。请根据给定的Schema和文本，抽取出所有满足关系的事实三元组，"
-    "并以列表形式输出。"
-)
+_LLM_SUBJECT_TYPES = "人物、电视综艺、娱乐人物、影视作品、企业/品牌、歌曲、图书作品、学科专业、机构、行政区、企业、文学作品、学校、国家、历史人物、景点、地点"
+_LLM_OBJECT_TYPES = "学校、人物、歌曲、音乐专辑、Date、Text、Number、气候、城市、地点、奖项、作品、语言、影视作品、企业、国家"
+_LLM_SCHEMA_RELATIONS = "导演、出生地、毕业院校、嘉宾、配音、主题曲、代言人、所属专辑、父亲、作者、上映时间、母亲、专业代码、占地面积、邮政编码、票房、注册资本、主角、妻子、编剧、气候、歌手、获奖、校长、创始人、首都、丈夫、朝代、饰演、面积、总部地点、祖籍、人口数量、制片人、修业年限、所在城市、董事长、作词、改编自、出品公司、作曲、主演、主持人、成立日期、简称、海拔、号、国籍、官方语言"
 
-ALPACA_SCHEMA = (
-    "### Schema\n"
-    "主体实体类型:人物,电视综艺,娱乐人物,影视作品,企业/品牌,歌曲,图书作品,学科专业,"
-    "机构,行政区,企业,文学作品,学校,国家,历史人物,景点,地点\n"
-    "对象实体类型:学校,人物,歌曲,音乐专辑,Date,Text,Number,气候,城市,地点,奖项,作品,"
-    "语言,影视作品,企业,国家\n"
-    "关系类型:毕业院校,嘉宾,配音,主题曲,代言人,所属专辑,父亲,作者,上映时间,母亲,"
-    "专业代码,占地面积,邮政编码,票房,注册资本,主角,妻子,编剧,气候,歌手,获奖,校长,"
-    "创始人,首都,丈夫,朝代,饰演,面积,总部地点,祖籍,人口数量,制片人,修业年限,"
-    "所在城市,董事长,作词,改编自,出品公司,导演,作曲,主演,主持人,成立日期,简称,"
-    "海拔,号,国籍,官方语言"
+_FORMAT_REQUIREMENT = (
+    "【重要格式要求】\n"
+    "你只能输出一个合法的 Python 列表结构，形如：[(\"主体\", \"关系\", \"客体\"), ...]\n"
+    "如果没有符合的三元组则输出 []。\n"
+    "绝对不要输出任何前言、后语、解释或 Markdown 代码块标记（如 ```python）。"
+    "你的回复必须直接以 '[' 开头，以 ']' 结尾。"
 )
 
 
-def _sample_to_alpaca(sample: Dict) -> Dict:
+def _build_llm_instruction(prompt_type: str) -> str:
+    """返回对应 prompt 类型的 instruction 字段内容（与 infer.py 保持一致）"""
+    if prompt_type == "base":
+        return (
+            "请从以下文本中抽取事实三元组。\n"
+            + _FORMAT_REQUIREMENT
+        )
+    elif prompt_type == "schema":
+        return (
+            "你是一个信息抽取专家。请从以下文本中抽取事实三元组。\n"
+            "【Schema约束】\n"
+            f"1. 主体只能是：{_LLM_SUBJECT_TYPES}\n"
+            f"2. 客体只能是：{_LLM_OBJECT_TYPES}\n"
+            f"3. 关系只能是：{_LLM_SCHEMA_RELATIONS}\n"
+            + _FORMAT_REQUIREMENT.replace(
+                "绝对不要输出任何前言、后语、解释或 Markdown 代码块标记（如 ```python）。",
+                "不要捏造列表以外的关系。绝对不要输出任何解释性文本、废话或 Markdown 代码块标记（如 ```python）。",
+            )
+        )
+    else:  # cot
+        return (
+            "你是一个信息抽取专家。请按照以下步骤从文本中抽取事实三元组：\n"
+            f"主体可选类型：{_LLM_SUBJECT_TYPES}\n"
+            f"客体可选类型：{_LLM_OBJECT_TYPES}\n"
+            f"关系可选类型：{_LLM_SCHEMA_RELATIONS}\n\n"
+            "步骤 1: 识别文本中出现的符合类型的主体和客体实体。\n"
+            "步骤 2: 根据限定的关系列表，判断实体之间存在的关系。\n"
+            "步骤 3: 严格按格式输出最终结果。\n\n"
+            + _FORMAT_REQUIREMENT.replace(
+                "绝对不要输出任何前言、后语、解释或 Markdown 代码块标记（如 ```python）。",
+                "不要捏造列表以外的关系。绝对不要输出任何解释性文本、废话或 Markdown 代码块标记（如 ```python）。",
+            )
+        )
+
+
+def _sample_to_alpaca(sample: Dict, prompt_type: str = "base") -> Dict:
     text = sample.get("text", "")
     spo_list = sample.get("spo_list", [])
     triples = []
@@ -558,16 +587,16 @@ def _sample_to_alpaca(sample: Dict) -> Dict:
         if s and p and o:
             triples.append(f'("{s}", "{p}", "{o}")')
     return {
-        "instruction": ALPACA_INSTRUCTION,
-        "input": f"{ALPACA_SCHEMA}\n\n### 文本\n{text}",
+        "instruction": _build_llm_instruction(prompt_type),
+        "input": f"### 文本\n{text}",
         "output": f"[{', '.join(triples)}]",
     }
 
 
-def format_llm(samples: List[Dict], output_file: str) -> None:
-    """生成 LLM（Alpaca 格式）数据"""
+def format_llm(samples: List[Dict], output_file: str, prompt_type: str = "base") -> None:
+    """生成 LLM（Alpaca 格式）数据，instruction 格式与 infer.py 推理时使用的 prompt 完全一致"""
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    data = [_sample_to_alpaca(s) for s in samples]
+    data = [_sample_to_alpaca(s, prompt_type) for s in samples]
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     logger.info(f"LLM Alpaca 数据已保存: {output_file} ({len(data)} 条)")
@@ -680,8 +709,15 @@ def main():
         logger.info("=== 生成 LLM 数据 ===")
         llm_dir = os.path.join(output_dir, "llm")
         os.makedirs(llm_dir, exist_ok=True)
+        # 每个 split × 三种 prompt 各生成一个文件，共 9 个
+        # 文件名格式：{split}_{prompt_type}.json，如 train_base.json / test_cot.json
         for split_name, samples in splits.items():
-            format_llm(samples, os.path.join(llm_dir, f"{split_name}.json"))
+            for ptype in ("base", "schema", "cot"):
+                format_llm(
+                    samples,
+                    os.path.join(llm_dir, f"{split_name}_{ptype}.json"),
+                    prompt_type=ptype,
+                )
         logger.info("LLM 数据生成完成")
 
     logger.info(f"所有数据已保存到: {output_dir}")
