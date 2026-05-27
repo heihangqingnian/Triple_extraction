@@ -5,7 +5,7 @@ seed: 42
 
 data:
   processed_dir: "data/processed/joint"
-  rel2id: "data/processed/shared/rel2id.json"
+  rel2id: "data/processed/joint/rel2id.json"
   train_prefix: "train"
   dev_prefix: "dev"
   test_prefix: "test"
@@ -13,7 +13,7 @@ data:
 model:
   bert_model: "methods/pipeline/ner/model"
   learning_rate: 1.0e-5
-  batch_size: 6
+  batch_size: 64
   max_length: 256
   epochs: 300
   eval_every: 5
@@ -25,8 +25,8 @@ model:
   checkpoint: "results/joint_ablation3/best.pt"
   use_subject_feedback: true   # 保留主实体反馈
   dual_encoder: false           # 使用共享单编码器
-  loss_alpha: 2.0               # 消融：侧重实体
-  loss_beta: 1.0
+  loss_alpha: 1.333             # 消融：侧重实体（比例 2:1，alpha+beta=2.0 与基线对齐）
+  loss_beta: 0.667
 
 output:
   dir: "results/joint_ablation3"

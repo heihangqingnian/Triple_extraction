@@ -31,7 +31,7 @@ re:
   epochs: 15
   dropout: 0.1
   patience: 5
-  checkpoint: "results/pipeline_ablation1/re_best.pt"
+  checkpoint: "results/pipeline/re_best.pt"
 
 output:
   dir: "results/pipeline_ablation1"

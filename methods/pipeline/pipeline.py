@@ -33,7 +33,12 @@ def _load_ner_model(cfg: dict, device: torch.device):
     data_cfg = cfg["data"]
     _, txt2label, label2txt = _build_label_maps(data_cfg["entity2id"])
     tokenizer = BertTokenizer.from_pretrained(ner_cfg["bert_model"])
-    model = BertNer(bert_path=ner_cfg["bert_model"], num_tags=len(txt2label)).to(device)
+    model = BertNer(
+        bert_path=ner_cfg["bert_model"],
+        num_tags=len(txt2label),
+        use_bilstm=ner_cfg.get("use_bilstm", True),
+        use_crf=ner_cfg.get("use_crf", True),
+    ).to(device)
     load_checkpoint(model, ner_cfg["checkpoint"], device=device)
     model.eval()
     return model, tokenizer, txt2label, label2txt
