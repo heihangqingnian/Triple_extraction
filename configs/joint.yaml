@@ -19,7 +19,7 @@ model:
   bert_model: "methods/pipeline/ner/model"
   # Adam 优化器学习率
   learning_rate: 1.0e-5
-  batch_size: 6
+  batch_size: 64
   max_length: 256
   # 最大训练 epoch 数
   epochs: 300

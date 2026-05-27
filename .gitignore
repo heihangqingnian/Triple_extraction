@@ -67,3 +67,5 @@ scripts/generate_prompt_data.py
 train_re_only.py
 PAPER.md
 result_temp/
+ZhipuAI/
+scripts/test_decode_fix.py

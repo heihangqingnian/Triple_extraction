@@ -5,7 +5,7 @@ seed: 42
 
 model:
   # ChatGLM2-6B 基础模型路径（本地路径或 HuggingFace/ModelScope ID）
-  base_model: "THUDM/chatglm2-6b"
+  base_model: "ZhipuAI/chatglm2-6b"
   # 三种 Prompt 策略各自对应的 LoRA 权重目录
   # 若目录不存在则自动回退到基础模型推理
   lora_weights:

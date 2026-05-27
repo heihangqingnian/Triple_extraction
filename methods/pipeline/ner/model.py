@@ -108,5 +108,5 @@ class BertNer(nn.Module):
         if self.use_crf:
             return self.crf.decode(logits, mask=mask)
         else:
-            # 贪心解码：取 argmax
-            return logits.argmax(dim=-1).cpu()
+            # 贪心解码：取 argmax，转为 list of lists 与 CRF decode 保持一致
+            return logits.argmax(dim=-1).cpu().tolist()

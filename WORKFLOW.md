@@ -272,7 +272,7 @@ python main.py --method pipeline --mode evaluate --config configs/ablation_pipel
 
 ```bash
 # 仅重训消融 1 的 RE 部分（NER 权重已存在）
-python main.py --method pipeline --mode train --component re --config configs/ablation_pipeline_1_no_bilstm.yaml
+python main.py --method pipeline --mode train --component ner --config configs/ablation_pipeline_1_no_bilstm.yaml
 
 # 仅重训消融 2 的 NER 部分
 python main.py --method pipeline --mode train --component ner --config configs/ablation_pipeline_2_no_crf.yaml
