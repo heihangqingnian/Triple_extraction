@@ -15,6 +15,7 @@ LoRA 权重配置支持两种格式（向后兼容）：
 """
 
 import os
+import threading
 from typing import List, Optional, Tuple
 
 from tqdm import tqdm
@@ -48,7 +49,11 @@ _FORMAT_REQ_STRICT = (
 
 def load_model(cfg: dict, prompt_type: str = "base"):
     """
-    加载 ChatGLM2-6B 基础模型并挂载对应 prompt_type 的 LoRA 权重
+    加载 ChatGLM2-6B 基础模型并挂载对应 prompt_type 的 LoRA 权重。
+
+    自动检测 CUDA 可用性：
+      - 有 GPU：使用 float16 + device_map，推理速度快
+      - 无 GPU：使用 float32 + CPU，推理速度慢但可运行
 
     Args:
         cfg:         configs/llm.yaml 解析后的完整配置 dict
@@ -58,13 +63,14 @@ def load_model(cfg: dict, prompt_type: str = "base"):
         (model, tokenizer)
     """
     try:
+        import torch
         from peft import PeftModel
         from transformers import AutoModel, AutoTokenizer
     except ImportError:
         raise ImportError("请安装 peft 和 transformers：pip install peft transformers")
 
     model_cfg = cfg["model"]
-    base_model = model_cfg["base_model"]
+    base_model_path = model_cfg["base_model"]
     device_arg = model_cfg.get("device", "auto")
 
     # 支持新格式（dict）和旧格式（str）
@@ -75,14 +81,36 @@ def load_model(cfg: dict, prompt_type: str = "base"):
         lora_weights = lora_cfg
 
     logger = get_logger("llm_infer")
-    logger.info(f"加载基础模型: {base_model}")
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        base_model,
-        trust_remote_code=True,
-        device_map=device_arg if device_arg != "cpu" else None,
-    )
+    # 根据是否有 GPU 选择 dtype 和 device_map
+    use_gpu = torch.cuda.is_available() and device_arg != "cpu"
+    if use_gpu:
+        dtype = torch.float16
+        device_map = device_arg  # "auto" 或指定 GPU
+        logger.info(f"使用 GPU（{torch.cuda.get_device_name(0)}），dtype=float16")
+    else:
+        dtype = torch.float32
+        device_map = None  # CPU 不使用 device_map
+        logger.warning("CUDA 不可用，回退到 CPU（float32），推理速度会非常慢")
+
+    logger.info(f"加载基础模型: {base_model_path}，dtype={dtype}, device_map={device_map}")
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
+
+    load_kwargs = {"trust_remote_code": True, "dtype": dtype}
+    if device_map is not None:
+        load_kwargs["device_map"] = device_map
+
+    model = AutoModel.from_pretrained(base_model_path, **load_kwargs)
+
+    # ChatGLM2Config 使用 num_layers 而非标准的 num_hidden_layers，
+    # PEFT 在注册 LoRA 层时会访问 num_hidden_layers，缺失则报 AttributeError。
+    if not hasattr(model.config, "num_hidden_layers"):
+        for _attr in ("num_layers", "n_layer", "n_layers"):
+            if hasattr(model.config, _attr):
+                model.config.num_hidden_layers = getattr(model.config, _attr)
+                logger.info(f"已将 config.{_attr} → config.num_hidden_layers = {model.config.num_hidden_layers}")
+                break
 
     if lora_weights and os.path.exists(lora_weights):
         logger.info(f"[{prompt_type}] 加载 LoRA 权重: {lora_weights}")
@@ -172,42 +200,107 @@ def predict_sample(
     cfg: dict,
     prompt_type: str = "base",
     prompt: str = None,
+    timeout: float = 0,
 ) -> List[Tuple[str, str, str]]:
     """
     对单条样本推理，返回三元组列表。
-
-    Args:
-        text:        原始文本（当 prompt=None 时用于动态构建 prompt）
-        model:       已加载的模型
-        tokenizer:   tokenizer
-        cfg:         llm 配置 dict
-        prompt_type: prompt 类型（prompt=None 时生效）
-        prompt:      预构建好的完整 prompt（优先使用；来自测试文件时应传入此参数）
-
-    Returns:
-        [(subject, predicate, object), ...]
+    优先使用 model.chat()；若失败则回退到手动 tokenize + model.generate()。
+    两条路径均传入 use_cache=False，规避 PEFT LoRA 与 ChatGLM2 KV-cache 的兼容问题。
+    timeout > 0 时将 max_time 传给 generate，超时后在当前 token 生成完毕后即停止。
     """
     import torch
 
+    logger = get_logger("llm_infer")
     model_cfg = cfg["model"]
-    final_prompt = prompt if prompt is not None else _build_prompt(text, prompt_type)
-    inputs = tokenizer(final_prompt, return_tensors="pt")
+    max_new_tokens = model_cfg.get("max_new_tokens", 512)
+    temperature = model_cfg.get("temperature", 0.1)
 
-    device = next(model.parameters()).device
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    full_prompt = prompt if prompt is not None else _build_prompt(text, prompt_type)
+
+    # 去掉末尾的 "答：" 后缀，避免传入 chat() 时重复
+    query = full_prompt
+    if query.endswith("\n\n答："):
+        query = query[: -len("\n\n答：")]
+
+    max_time = float(timeout) if timeout > 0 else None
+
+    # ── 方法一：model.chat() ──────────────────────────────────
+    if hasattr(model, "chat"):
+        try:
+            chat_kwargs: dict = {"use_cache": False}
+            if max_time:
+                chat_kwargs["max_time"] = max_time
+            response, _ = model.chat(
+                tokenizer,
+                query,
+                history=[],
+                max_length=max_new_tokens + 2048,
+                temperature=max(temperature, 1e-4),
+                do_sample=temperature > 1e-4,
+                **chat_kwargs,
+            )
+            return list(parse_triple_string(response or ""))
+        except Exception as e:
+            logger.warning(f"model.chat() 失败，回退到 generate(): {e}")
+
+    # ── 方法二：手动 tokenize + model.generate() ─────────────
+    if hasattr(tokenizer, "build_prompt"):
+        formatted = tokenizer.build_prompt(query, history=[])
+    else:
+        formatted = query
+
+    inputs = tokenizer(formatted, return_tensors="pt", add_special_tokens=False)
+    input_ids = inputs.get("input_ids")
+    attention_mask = inputs.get("attention_mask")
+
+    if input_ids is None:
+        raise ValueError("tokenizer 返回了 None 作为 input_ids")
+
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+
+    input_ids = input_ids.to(device)
+    gen_kwargs: dict = {
+        "input_ids": input_ids,
+        "max_new_tokens": max_new_tokens,
+        "use_cache": False,  # PEFT LoRA 与 ChatGLM2 KV-cache 不兼容，禁用缓存
+    }
+    if max_time:
+        gen_kwargs["max_time"] = max_time
+    if attention_mask is not None:
+        gen_kwargs["attention_mask"] = attention_mask.to(device)
+    if temperature > 1e-4:
+        gen_kwargs.update({"do_sample": True, "temperature": temperature})
+    else:
+        gen_kwargs["do_sample"] = False
 
     with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=model_cfg.get("max_new_tokens", 512),
-            temperature=model_cfg.get("temperature", 0.1),
-            do_sample=False,
-        )
+        raw_out = model.generate(**gen_kwargs)
 
-    generated = tokenizer.decode(
-        output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
-    )
-    return list(parse_triple_string(generated))
+    if raw_out is None:
+        raise ValueError("model.generate() 返回了 None")
+
+    # 兼容 Tensor 和 GenerateOutput（HuggingFace 新版返回 ModelOutput）
+    if hasattr(raw_out, "sequences"):
+        seqs = raw_out.sequences
+    elif isinstance(raw_out, torch.Tensor):
+        seqs = raw_out
+    else:
+        raise ValueError(f"无法识别的 generate() 输出类型: {type(raw_out)}")
+
+    input_len = input_ids.shape[1]
+    generated_ids = seqs[0][input_len:]
+    response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    # 用 ChatGLM2 的 process_response 清理输出（如果可用）
+    for m_obj in (model, getattr(model, "base_model", None)):
+        if m_obj is not None and hasattr(m_obj, "process_response"):
+            response = m_obj.process_response(response)
+            break
+
+    return list(parse_triple_string(response))
 
 
 def predict_file(
@@ -245,6 +338,7 @@ def predict_file(
     else:
         types_to_run = ["base", "schema", "cot"]
     logger.info(f"将运行变体: {types_to_run}")
+    per_sample_timeout: float = cfg.get("inference", {}).get("per_sample_timeout", 60)
 
     # 各变体的默认测试文件映射（支持 llm.yaml 中的 test_files 字典）
     test_files_map = cfg.get("data", {}).get("test_files", {})
@@ -270,13 +364,38 @@ def predict_file(
             text = _extract_text_from_sample(sample)
             label_str = sample.get("output", "[]")
 
-            try:
-                pred_triples = predict_sample("", model, tokenizer, cfg, prompt_type, prompt=prompt_str)
-                parse_error = False
-            except Exception as e:
-                logger.warning(f"推理失败: {e}")
+            result_box: list = [None]
+            err_box: list = [None]
+            done = threading.Event()
+
+            def _infer(ps=prompt_str):
+                try:
+                    result_box[0] = predict_sample(
+                        "", model, tokenizer, cfg, prompt_type,
+                        prompt=ps, timeout=per_sample_timeout,
+                    )
+                except Exception as exc:
+                    err_box[0] = exc
+                done.set()
+
+            threading.Thread(target=_infer, daemon=True).start()
+            timed_out = not done.wait(
+                timeout=per_sample_timeout if per_sample_timeout > 0 else None
+            )
+
+            if timed_out:
+                logger.warning(f"推理超时（>{per_sample_timeout:.0f}s），已跳过")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 pred_triples = []
                 parse_error = True
+            elif err_box[0] is not None:
+                logger.warning(f"推理失败: {err_box[0]}")
+                pred_triples = []
+                parse_error = True
+            else:
+                pred_triples = result_box[0] or []
+                parse_error = False
 
             outputs.append({
                 "prompt_type": prompt_type,

@@ -28,6 +28,9 @@ data:
   test_file: "data/processed/llm/test_base.json"
   predictions_file: "results/llm/predictions.jsonl"
 
+inference:
+  per_sample_timeout: 60  # 单条样本最大推理时间（秒），0 表示不限制
+
 output:
   dir: "results/llm"
   predictions: "results/llm/predictions.jsonl"
