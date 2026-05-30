@@ -10,7 +10,7 @@ Usage::
     python scripts/fine_grained_eval.py
     python scripts/fine_grained_eval.py --pipeline results/pipeline/predictions.jsonl \\
                                          --joint   results/joint/predictions.jsonl \\
-                                         --llm_dir results/llm
+                                         --llm     results/llm/predictions.jsonl
 """
 
 import argparse
@@ -26,7 +26,6 @@ from utils.io_utils import load_jsonl
 from utils.metrics import TripleMetrics, parse_triple_string
 
 OVERLAP_TYPES = ["Normal", "SEO", "EPO"]
-LLM_PROMPT_TYPES = ["base", "schema", "cot"]
 
 
 # ── 重叠类型分类 ──────────────────────────────────────────────────────────
@@ -185,8 +184,8 @@ def main():
                         help="Pipeline 预测文件路径")
     parser.add_argument("--joint", default="results/joint/predictions.jsonl",
                         help="Joint 预测文件路径")
-    parser.add_argument("--llm_dir", default="results/llm",
-                        help="LLM 预测文件所在目录（含 predictions_base/schema/cot.jsonl）")
+    parser.add_argument("--llm", default="results/llm/predictions.jsonl",
+                        help="LLM 预测文件路径（单 Prompt/单 LoRA 的最终测试预测）")
     args = parser.parse_args()
 
     method_results: Dict[str, Dict[str, Dict]] = {}
@@ -205,14 +204,12 @@ def main():
     else:
         print(f"[跳过] Joint 预测文件不存在: {args.joint}")
 
-    # LLM（每种 prompt 类型独立评估）
-    for pt in LLM_PROMPT_TYPES:
-        llm_pred = Path(args.llm_dir) / f"predictions_{pt}.jsonl"
-        if llm_pred.exists():
-            print(f"加载 LLM-{pt} 预测: {llm_pred}")
-            method_results[f"LLM-{pt}"] = evaluate_by_overlap(load_predictions(str(llm_pred)))
-        else:
-            print(f"[跳过] LLM-{pt} 预测文件不存在: {llm_pred}")
+    # LLM（单 Prompt/单 LoRA 的最终测试预测）
+    if Path(args.llm).exists():
+        print(f"加载 LLM 预测: {args.llm}")
+        method_results["LLM"] = evaluate_by_overlap(load_predictions(args.llm))
+    else:
+        print(f"[跳过] LLM 预测文件不存在: {args.llm}")
 
     if not method_results:
         print("\n未找到任何预测文件，请先运行各方法的评估：")

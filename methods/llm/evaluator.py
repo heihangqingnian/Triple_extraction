@@ -1,134 +1,128 @@
 # -*- coding: utf-8 -*-
 """
-LLM 方法预测结果评估
+LLM 方法最终测试评估（单 Prompt / 单 LoRA）。
 
-支持对三种 Prompt 类型（base / schema / cot）分别评估，
-也可一次性评估全部并汇总写入 metrics.json。
+读取 infer.predict_file 产出的 predictions.jsonl，用 ComprehensiveMetrics 计算指标，
+输出结构与 Pipeline / Joint 基线完全一致的 metrics.json（严格/宽松 × 微平均/宏平均
++ 逐关系 + 错误报告 + 错误案例），保证三种方法在同一套测试集、同一套指标下可比。
 """
 
 import os
-from collections import defaultdict
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from utils.common import get_logger
 from utils.io_utils import load_jsonl, save_json
-from utils.metrics import TripleMetrics, analyze_errors, save_error_report, parse_triple_string
+from utils.metrics import (
+    ComprehensiveMetrics,
+    analyze_errors,
+    export_error_cases,
+    parse_triple_string,
+    per_relation_metrics,
+    save_error_report,
+)
 
-PROMPT_TYPES = ["base", "schema", "cot"]
+
+def _to_triple_dicts(triple_set) -> List[Dict]:
+    return [{"subject": s, "predicate": p, "object": {"@value": o}} for s, p, o in triple_set]
 
 
-
-def evaluate(
-    cfg: dict,
-    prompt_type: Optional[str] = None,
-    predictions_file: Optional[str] = None,
-    output_dir: Optional[str] = None,
-) -> Dict:
+def evaluate(cfg: dict, predictions_file: Optional[str] = None, output_dir: Optional[str] = None) -> Dict:
     """
-    LLM 预测结果评估。
+    评估 LLM 测试预测结果。
 
     Args:
         cfg:              configs/llm.yaml 配置 dict
-        prompt_type:      指定评估某一类型（base/schema/cot）；
-                          为 None 时自动遍历全部三种并汇总。
-        predictions_file: 指定预测文件路径（仅在 prompt_type 非 None 时生效）。
-        output_dir:       结果输出目录。
+        predictions_file: 指定预测文件（默认 cfg["output"]["dir"]/predictions.jsonl）
+        output_dir:       结果输出目录（默认 cfg["output"]["dir"]）
 
     Returns:
-        评估结果字典。prompt_type=None 时顶层 key 为 prompt_type，
-        否则直接返回单类型结果。
+        指标字典（与 pipeline/joint 的 metrics.json 同结构）。
     """
     logger = get_logger("llm_eval")
     out_dir = output_dir or cfg["output"]["dir"]
     os.makedirs(out_dir, exist_ok=True)
 
-    if prompt_type is None:
-        # 评估全部三种 prompt 类型
-        all_results: Dict = {}
-        for pt in PROMPT_TYPES:
-            pred_file = os.path.join(cfg["output"]["dir"], f"predictions_{pt}.jsonl")
-            if not os.path.exists(pred_file):
-                logger.warning(f"预测文件不存在，跳过: {pred_file}")
-                continue
-            all_results[pt] = _evaluate_single(pred_file, out_dir, pt, logger)
-
-        if not all_results:
-            raise FileNotFoundError(
-                "未找到任何预测文件，请先运行：python main.py --method llm --mode predict"
-            )
-
-        save_json(all_results, os.path.join(out_dir, "metrics.json"))
-        logger.info(f"全部 prompt 类型评估完成，结果已保存到: {out_dir}/metrics.json")
-        _print_summary(all_results)
-        return all_results
-
-    # 评估单一 prompt 类型
-    pred_file = predictions_file or os.path.join(out_dir, f"predictions_{prompt_type}.jsonl")
+    pred_file = predictions_file or os.path.join(out_dir, "predictions.jsonl")
     if not os.path.exists(pred_file):
         raise FileNotFoundError(
             f"预测文件不存在: {pred_file}\n"
             "请先运行推理：python main.py --method llm --mode predict"
         )
-    result = _evaluate_single(pred_file, out_dir, prompt_type, logger)
-    save_json(result, os.path.join(out_dir, f"metrics_{prompt_type}.json"))
-    logger.info(f"评估完成，结果已保存到: {out_dir}/metrics_{prompt_type}.json")
-    return result
 
-
-def _evaluate_single(pred_file: str, out_dir: str, prompt_type: str, logger) -> Dict:
-    """对单个预测文件执行评估，返回指标字典并写入错误报告。"""
-    logger.info(f"[{prompt_type}] 加载预测文件: {pred_file}")
+    logger.info(f"加载预测文件: {pred_file}")
     records = load_jsonl(pred_file)
 
-    metrics = TripleMetrics()
-    total_errors: Dict[str, int] = defaultdict(int)
+    metrics = ComprehensiveMetrics()
+    error_counts: Dict[str, int] = {}
+    pred_triples_all: List[List] = []
+    gold_triples_all: List[List] = []
+    sample_outputs: List[Dict] = []
     parse_errors = 0
 
     for rec in records:
         if rec.get("parse_error", False):
             parse_errors += 1
-            continue
 
-        pred_set = parse_triple_string(rec.get("predict", "[]"))
-        gold_set = parse_triple_string(rec.get("label", "[]"))
-
-        pred_triples = [{"subject": s, "predicate": p, "object": {"@value": o}} for s, p, o in pred_set]
-        gold_triples = [{"subject": s, "predicate": p, "object": {"@value": o}} for s, p, o in gold_set]
+        pred_triples = _to_triple_dicts(parse_triple_string(rec.get("predict", "[]")))
+        gold_triples = _to_triple_dicts(parse_triple_string(rec.get("label", "[]")))
 
         metrics.update(pred_triples, gold_triples)
+        pred_triples_all.append(pred_triples)
+        gold_triples_all.append(gold_triples)
+
         for k, v in analyze_errors(pred_triples, gold_triples).items():
-            total_errors[k] += v
+            error_counts[k] = error_counts.get(k, 0) + v
 
+        sample_outputs.append({
+            "text": rec.get("text", ""),
+            "pred_triples": pred_triples,
+            "gold_triples": gold_triples,
+        })
+
+    # ── 汇总结果（与 pipeline/joint 同结构）──────────────────────────────
     result = metrics.compute()
-    result.update({
-        "model": f"llm_lora_{prompt_type}",
-        "prompt_type": prompt_type,
-        "total_predictions": len(records),
-        "parse_errors": parse_errors,
-        "parse_error_rate": round(parse_errors / max(len(records), 1), 6),
-        "error_counts": dict(total_errors),
-    })
+    result["model"] = "llm_lora"
+    result["total_predictions"] = len(records)
+    result["parse_errors"] = parse_errors
+    result["parse_error_rate"] = round(parse_errors / max(len(records), 1), 6)
+    result["error_counts"] = error_counts
 
-    metrics.print_report(f"LLM [{prompt_type}] 评估结果")
-    logger.info(f"[{prompt_type}] 解析失败数: {parse_errors} / {len(records)}")
+    rel_metrics = per_relation_metrics(pred_triples_all, gold_triples_all)
+    result["per_relation"] = rel_metrics
 
+    metrics.print_report("LLM 最终测试评估")
+    logger.info(f"解析失败数: {parse_errors} / {len(records)}")
+
+    # ── 持久化输出（文件名与 pipeline/joint 一致）────────────────────────
+    save_json(result, cfg["output"].get("metrics", os.path.join(out_dir, "metrics.json")))
     save_error_report(
-        dict(total_errors),
-        os.path.join(out_dir, f"error_report_{prompt_type}.txt"),
-        model_name=f"llm_lora_{prompt_type}",
+        error_counts,
+        cfg["output"].get("error_report", os.path.join(out_dir, "error_report.txt")),
+        model_name="llm_lora",
     )
+    export_error_cases(sample_outputs, Path(out_dir) / "error_cases.txt")
+
+    rel_path = Path(out_dir) / "per_relation.txt"
+    with open(rel_path, "w", encoding="utf-8") as f:
+        f.write(f"{'关系类型':<22} {'P':>8} {'R':>8} {'F1':>8} {'Support':>9} {'Pred':>7} {'Correct':>8}\n")
+        f.write(f"{'-' * 72}\n")
+        rows = sorted(
+            [(k, v) for k, v in rel_metrics.items() if k != "__overall__"],
+            key=lambda x: -x[1]["support"],
+        )
+        for rel, m in rows:
+            f.write(f"{rel:<22} {m['precision']:>8.4f} {m['recall']:>8.4f} {m['f1']:>8.4f} "
+                    f"{m['support']:>9} {m['predicted']:>7} {m['correct']:>8}\n")
+        if "__overall__" in rel_metrics:
+            ov = rel_metrics["__overall__"]
+            f.write(f"{'-' * 72}\n")
+            f.write(f"{'Overall':<22} {ov['precision']:>8.4f} {ov['recall']:>8.4f} {ov['f1']:>8.4f} "
+                    f"{ov['support']:>9} {ov['predicted']:>7} {ov['correct']:>8}\n")
+    print(f"关系级指标已保存到: {rel_path}")
+
+    logger.info(f"评估完成，所有结果已保存到: {out_dir}")
     return result
-
-
-def _print_summary(all_results: Dict) -> None:
-    """打印三种 prompt 类型的 F1 对比"""
-    print("\n" + "=" * 58)
-    print(f"  {'Prompt':<10} {'Precision':>10} {'Recall':>10} {'F1':>10}")
-    print("=" * 58)
-    for pt, r in all_results.items():
-        print(f"  {pt:<10} {r.get('precision', 0):>10.4f} "
-              f"{r.get('recall', 0):>10.4f} {r.get('f1', 0):>10.4f}")
-    print("=" * 58)
 
 
 def run(
@@ -136,41 +130,31 @@ def run(
     mode: str,
     input_path: Optional[str] = None,
     output_path: Optional[str] = None,
-    variant: str = "all",
 ) -> None:
     """
-    LLM 方法统一入口
+    LLM 方法统一入口（最终测试阶段）。
 
     Args:
         cfg:         configs/llm.yaml 配置 dict
-        mode:        train / predict / evaluate
-        input_path:  predict 时为输入文件；evaluate 时为指定预测文件（仅 variant 非 all 时生效）
-        output_path: predict 时为输出文件（单变体）或忽略（all）；evaluate 时为输出目录
-        variant:     LoRA 变体 base/schema/cot/all（默认 all）
+        mode:        predict / evaluate / train
+        input_path:  predict 时为测试输入文件；evaluate 时为指定预测文件
+        output_path: predict 时为输出文件；evaluate 时为输出目录
     """
     from utils.common import set_seed
     set_seed(cfg["seed"])
 
     if mode == "predict":
         from methods.llm.infer import predict_file
-        predict_file(cfg, input_file=input_path, output_file=output_path, variant=variant)
+        predict_file(cfg, input_file=input_path, output_file=output_path)
 
     elif mode == "evaluate":
-        # 优先级：命令行 --variant > config 中 model.prompt_type > 全部运行
-        cfg_prompt_type = cfg.get("model", {}).get("prompt_type")
-        if variant != "all":
-            prompt_type = variant
-        elif cfg_prompt_type:
-            prompt_type = cfg_prompt_type
-        else:
-            prompt_type = None  # evaluate all
-        pred_file = input_path if prompt_type is not None else None
-        evaluate(cfg, prompt_type=prompt_type, predictions_file=pred_file, output_dir=output_path)
+        evaluate(cfg, predictions_file=input_path, output_dir=output_path)
 
     elif mode == "train":
         print(
-            "LLM 训练通过 LlamaFactory 框架完成，不在本仓库中。\n"
-            "请参考 WORKFLOW.md 中的 LLM 训练说明。"
+            "LLM 微调通过 LLaMA-Factory 完成，不在本仓库中。\n"
+            "请先用 scripts/prompt_search.py 选最优 Prompt，再用 scripts/build_llm_dataset.py "
+            "构造 train.json，然后在 LLaMA-Factory 中微调。详见 WORKFLOW.md。"
         )
     else:
         raise ValueError(f"未知 mode: {mode}")

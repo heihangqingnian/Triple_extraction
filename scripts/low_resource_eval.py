@@ -174,21 +174,31 @@ def prepare_joint_data(ratio: float, label: str) -> str:
 
 # ── LLM 数据采样（仅生成文件，不训练）────────────────────────────────────
 
-def prepare_llm_data(ratio: float, label: str) -> str:
+def prepare_llm_data(ratio: float, label: str, prompt: str = "base") -> str:
     """
-    为 LLM 方法生成低资源训练数据（Alpaca JSON 格式）。
-    返回新的数据目录路径。
+    为 LLM 方法生成低资源训练数据（单 Prompt 的 Alpaca JSON）。
+
+    从 train_raw.jsonl 采样后，用选定的最优 Prompt 构造 train.json（system 字段承载固定指令），
+    供 LLaMA-Factory 微调。返回新的数据目录路径。
     """
     src_base = Path("data/processed/llm")
     dst_base = Path(f"data/processed/low_resource/{label}/llm")
 
-    for variant in ("base", "schema", "cot"):
-        src = src_base / f"train_{variant}.json"
-        dst = dst_base / f"train_{variant}.json"
-        if src.exists():
-            _sample_json_array(str(src), str(dst), ratio)
-        else:
-            logger.warning(f"LLM 训练文件不存在: {src}")
+    raw_src = src_base / "train_raw.jsonl"
+    if not raw_src.exists():
+        logger.warning(f"LLM raw 训练文件不存在: {raw_src}")
+        return str(dst_base)
+
+    # 采样 raw 行
+    raw_dst = dst_base / "train_raw.jsonl"
+    _sample_jsonl(str(raw_src), str(raw_dst), ratio)
+
+    # 用选定 Prompt 构造单一 train.json（复用 build_llm_dataset 的逻辑）
+    from scripts.build_llm_dataset import _raw_to_alpaca
+    from utils.io_utils import load_jsonl, save_json
+    alpaca = [_raw_to_alpaca(r, prompt) for r in load_jsonl(str(raw_dst))]
+    save_json(alpaca, str(dst_base / "train.json"))
+    logger.info(f"LLM 低资源训练数据已生成: {dst_base / 'train.json'}（prompt={prompt}，{len(alpaca)} 条）")
 
     return str(dst_base)
 
@@ -301,6 +311,10 @@ def main():
         "--data_only", action="store_true",
         help="仅生成采样数据文件，不执行训练",
     )
+    parser.add_argument(
+        "--prompt", default="base", choices=["base", "schema", "cot"],
+        help="LLM 低资源数据使用的 Prompt（应为免训练寻优选出的最优 Prompt，默认 base）",
+    )
     parser.add_argument("--seed", type=int, default=SEED)
     args = parser.parse_args()
 
@@ -336,9 +350,9 @@ def main():
                 print(f"  Joint   F1: {f1}")
 
         if "llm" in args.methods:
-            llm_dir = prepare_llm_data(ratio, label)
+            llm_dir = prepare_llm_data(ratio, label, prompt=args.prompt)
             print(f"  LLM 数据已生成: {llm_dir}")
-            print(f"  LLM 训练请使用 LlamaFactory，训练数据路径: {llm_dir}/train_{{base|schema|cot}}.json")
+            print(f"  LLM 训练请使用 LlamaFactory，训练数据路径: {llm_dir}/train.json（prompt={args.prompt}）")
 
     if args.data_only:
         labels = [RATIO_LABELS.get(r, f"{int(r*100)}pct") for r in args.ratios]

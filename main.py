@@ -16,23 +16,14 @@ Usage::
     python main.py --method joint --mode evaluate
     python main.py --method joint --mode predict
 
-    # LLM 方法（需要已训练的 LoRA 权重）
-    # 方式一：使用各变体独立配置文件（推荐）
-    python main.py --method llm --mode predict  --config configs/llm_base.yaml
-    python main.py --method llm --mode evaluate --config configs/llm_base.yaml
-    python main.py --method llm --mode predict  --config configs/llm_schema.yaml
-    python main.py --method llm --mode evaluate --config configs/llm_schema.yaml
-    python main.py --method llm --mode predict  --config configs/llm_cot.yaml
-    python main.py --method llm --mode evaluate --config configs/llm_cot.yaml
-
-    # 方式二：使用主配置 + --variant 参数
-    python main.py --method llm --mode predict                          # 推理全部 3 个 LoRA 变体
-    python main.py --method llm --mode predict --variant base           # 只推理 base LoRA
-    python main.py --method llm --mode predict --variant schema         # 只推理 schema LoRA
-    python main.py --method llm --mode predict --variant cot            # 只推理 cot LoRA
-    python main.py --method llm --mode evaluate                         # 评估全部 3 个变体
-    python main.py --method llm --mode evaluate --variant base          # 只评估 base 变体
-    python main.py --method llm --mode evaluate --variant base --input results/llm/predictions_base.jsonl
+    # LLM 方法（单 Prompt / 单 LoRA；完整流程见 WORKFLOW.md）
+    #   0. 免训练选最优 Prompt：python scripts/prompt_search.py --config configs/llm_prompt_search.yaml
+    #   1. 构造微调/测试数据：   python scripts/build_llm_dataset.py --prompt <best> --split all
+    #   2. 用 LLaMA-Factory 微调出单一 LoRA（template=chatglm2）
+    #   3. 测试推理与评估：
+    python main.py --method llm --mode predict     # 基座+单 LoRA 在测试集推理
+    python main.py --method llm --mode evaluate    # ComprehensiveMetrics 评估（与基线一致）
+    python main.py --method llm --mode evaluate --input results/llm/predictions.jsonl
 
     # 对比所有方法（evaluate 模式）
     python main.py --method all --mode evaluate
@@ -111,12 +102,6 @@ def parse_args():
         default=None,
         help="预测结果或评估报告的输出路径（可选，覆盖配置文件中的默认路径）",
     )
-    parser.add_argument(
-        "--variant",
-        default="all",
-        choices=["base", "schema", "cot", "all"],
-        help="LLM 方法：指定要推理/评估的 LoRA 变体（base/schema/cot/all，默认 all）",
-    )
     return parser.parse_args()
 
 
@@ -152,13 +137,13 @@ def run_joint(cfg: dict, mode: str, input_path: str = None, output_path: str = N
     run(cfg, mode, input_path=input_path, output_path=output_path)
 
 
-def run_llm(cfg: dict, mode: str, input_path: str = None, output_path: str = None, variant: str = "all"):
+def run_llm(cfg: dict, mode: str, input_path: str = None, output_path: str = None):
     from methods.llm.evaluator import run
-    run(cfg, mode, input_path=input_path, output_path=output_path, variant=variant)
+    run(cfg, mode, input_path=input_path, output_path=output_path)
 
 
 def run_all_evaluate():
-    """并排对比三种方法的评估结果"""
+    """并排对比三种方法的评估结果（统一读取 ComprehensiveMetrics 的 strict_micro）"""
     from utils.common import load_yaml
 
     results = {}
@@ -175,10 +160,13 @@ def run_all_evaluate():
     print(f"  {'方法':<12} {'Precision':>10} {'Recall':>10} {'F1':>10}")
     print("=" * 65)
     for method, r in results.items():
-        p = r.get("precision", "N/A")
-        rec = r.get("recall", "N/A")
-        f1 = r.get("f1", "N/A")
-        if isinstance(p, float):
+        # 三方法 metrics.json 均为 ComprehensiveMetrics 结构，P/R/F1 在 strict_micro 下；
+        # 兼容历史扁平结构（顶层直接含 precision）。
+        block = r.get("strict_micro", r)
+        p = block.get("precision", "N/A")
+        rec = block.get("recall", "N/A")
+        f1 = block.get("f1", "N/A")
+        if isinstance(p, (int, float)):
             print(f"  {method:<12} {p:>10.4f} {rec:>10.4f} {f1:>10.4f}")
         else:
             print(f"  {method:<12} {'N/A':>10} {'N/A':>10} {r.get('note', 'N/A'):>10}")
@@ -202,7 +190,7 @@ def main():
         run_joint(cfg, args.mode, input_path=args.input, output_path=args.output)
 
     elif args.method == "llm":
-        run_llm(cfg, args.mode, input_path=args.input, output_path=args.output, variant=args.variant)
+        run_llm(cfg, args.mode, input_path=args.input, output_path=args.output)
 
     elif args.method == "all":
         if args.mode != "evaluate":

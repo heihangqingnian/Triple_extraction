@@ -87,14 +87,14 @@ data/processed/
 │   ├── dev/dev.json
 │   └── test/test.json
 └── llm/
-    ├── train_base.json     # 三种变体的 Alpaca 格式训练集（用于 LlamaFactory 微调）
-    ├── train_schema.json
-    ├── train_cot.json
-    ├── dev_{base,schema,cot}.json   # 验证集（三种格式）
-    ├── test_base.json      # 测试集（三种格式），推理时直接从文件读取 prompt
-    ├── test_schema.json    # instruction 字段与训练数据完全一致，无需代码动态拼接
-    └── test_cot.json
+    ├── train_raw.jsonl     # Prompt 无关的规范化样本（每行 {text, triples}）
+    ├── dev_raw.jsonl       # 验证集（供免训练 Prompt 寻优，绝不用 test）
+    └── test_raw.jsonl      # 测试集（仅最终评估时由 build_llm_dataset.py 派生 test.json）
 ```
+
+> LLM 的 Prompt 不在预处理阶段固化。预处理只产出与 Prompt 无关的 `*_raw.jsonl`，
+> 之后由 `scripts/prompt_search.py`（免训练寻优）与 `scripts/build_llm_dataset.py`
+> （选定最优 Prompt 后构造 `train.json` / `test.json`）分别消费。
 
 ---
 
@@ -184,129 +184,97 @@ python main.py --method joint --mode predict \
 
 ## 5. LLM 方法（ChatGLM2-6B）
 
-LLM 方法分为两个阶段：**LoRA 微调**（通过 LlamaFactory）和**推理评估**（本仓库）。
+> **设计变更**：不再为每个 Prompt 各训一套 LoRA（LoRA 的「肌肉记忆」会掩盖 Prompt
+> 指令设计本身的优劣）。改为**免训练寻优**先选出最优 Prompt，再**只用这一个 Prompt**
+> 微调出**单一 LoRA**。全程严格隔离 Train/Val/Test，免训练寻优**绝不触碰测试集**。
 
-三个 LoRA 变体对应三种 Prompt 策略，分别有独立配置文件：
+四个阶段：
 
-| 变体   | 配置文件                  | LoRA 权重路径                  | Prompt 策略                   |
-| ------ | ------------------------- | ------------------------------ | ----------------------------- |
-| base   | `configs/llm_base.yaml`   | `models/chatglm2-lora-base/`   | 基础指令，无约束              |
-| schema | `configs/llm_schema.yaml` | `models/chatglm2-lora-schema/` | 加入 Schema 实体/关系类型约束 |
-| cot    | `configs/llm_cot.yaml`    | `models/chatglm2-lora-cot/`    | Chain-of-Thought 分步推理     |
+| 阶段             | 脚本 / 命令                                   | 是否需要模型 | 数据集     |
+| ---------------- | --------------------------------------------- | ------------ | ---------- |
+| ① 免训练 Prompt 寻优 | `scripts/prompt_search.py`                | 仅基座，无 LoRA | dev（或 train） |
+| ② 构造微调数据   | `scripts/build_llm_dataset.py --prompt <best>` | 否           | train + test |
+| ③ LoRA 微调      | 外部 LLaMA-Factory                            | 是           | train.json |
+| ④ 最终测试评估   | `main.py --method llm`                        | 基座 + 单 LoRA | **test** |
 
-### 5.1 LoRA 微调（外部 LlamaFactory）
+候选 Prompt 变体（指令文本集中在 `methods/llm/prompt_templates.py`，三处共用）：
+
+| 变体   | Prompt 策略                   |
+| ------ | ----------------------------- |
+| base   | 基础指令，无约束              |
+| schema | 加入 Schema 实体/关系类型约束 |
+| cot    | Chain-of-Thought 分步推理     |
+
+### 5.1 免训练 Prompt 寻优（不加载任何 LoRA）
 
 ```bash
-# 安装 LlamaFactory
-pip install llamafactory
+# 用基座模型在验证集小样本（默认 150 条）上对比各 Prompt 变体的三元组 F1
+python scripts/prompt_search.py --config configs/llm_prompt_search.yaml
+```
 
-# 训练 base LoRA（以 base 为例，schema/cot 同理，替换 output_dir 和 prompt 格式）
+- 配置 `configs/llm_prompt_search.yaml`：`model.lora_weights: null`（纯基座），
+  `search.source_split` 仅允许 `dev` / `train`（指向 `test` 会被代码直接拒绝，杜绝泄露）。
+- 可在配置里开启 Few-shot（`search.few_shot.enabled: true`），示例从 `train_raw` 采样且排除评估样本。
+- 产出 `results/llm/prompt_search/ranking.json` 与终端排名表，并打印 **★ 最优 Prompt**。
+
+### 5.2 构造微调 / 测试数据（选定最优 Prompt 后）
+
+```bash
+# 假设寻优选出 schema 最优
+python scripts/build_llm_dataset.py --prompt schema --split all
+```
+
+产出（`data/processed/llm/`）：
+
+- `train.json` — LLaMA-Factory 微调数据；**固定指令放入 `system` 字段**，每条不重复
+- `test.json`  — 最终测试推理用（格式与训练完全一致）
+- `dataset_info.json` — LLaMA-Factory 数据集注册片段（映射 system/instruction/output，模板 `chatglm2`）
+
+> **关键一致性**：训练（LLaMA-Factory `chatglm2` 模板 + system）与推理
+> （`methods/llm/infer.py` 复现同一模板 + system）的提示串必须逐字一致，否则 LoRA 失配掉点。
+> 二者共用 `prompt_templates.py` 的同一份定义；如需核对，可用
+> `python -c "from methods.llm.prompt_templates import assemble_preview; print(assemble_preview('schema','示例文本'))"`
+> 打印逻辑提示串，对照你的 LLaMA-Factory 版本确认。
+
+### 5.3 LoRA 微调（外部 LLaMA-Factory）
+
+`build_llm_dataset.py` 运行结束会打印对齐好的训练命令，核心如下（务必 `--template chatglm2`）：
+
+```bash
 llamafactory-cli train \
+    --stage sft --do_train \
     --model_name_or_path ZhipuAI/chatglm2-6b \
-    --finetuning_type lora \
-    --dataset data/processed/llm/train.json \
-    --dataset_dir . \
-    --output_dir models/chatglm2-lora-base \
-    --num_train_epochs 3 \
-    --per_device_train_batch_size 4 \
-    --learning_rate 2e-4 \
-    --lora_rank 8
+    --finetuning_type lora --template chatglm2 \
+    --dataset duie_lora_train --dataset_dir data/processed/llm \
+    --output_dir models/chatglm2-lora \
+    --num_train_epochs 3 --per_device_train_batch_size 4 \
+    --learning_rate 2e-4 --lora_rank 8 --cutoff_len 1024
 ```
 
-若暂无 LoRA 权重，推理将自动回退到基础模型（日志中会提示 Warning）。
+若 `models/chatglm2-lora` 不存在，推理会自动回退到基座模型（日志中提示 Warning）。
 
-### 5.2 推理
-
-**方式一（推荐）：使用各变体独立配置文件**
-
-每个配置文件指定对应的 LoRA 路径、Prompt 类型和结果输出目录，互不干扰：
+### 5.4 最终测试推理与评估
 
 ```bash
-# base 变体：结果保存到 results/llm/base/
-python main.py --method llm --mode predict --config configs/llm_base.yaml
-
-# schema 变体：结果保存到 results/llm/schema/
-python main.py --method llm --mode predict --config configs/llm_schema.yaml
-
-# cot 变体：结果保存到 results/llm/cot/
-python main.py --method llm --mode predict --config configs/llm_cot.yaml
-```
-
-**方式二：使用主配置 + `--variant` 参数**
-
-```bash
-# 一次性对全部三个变体推理（按顺序加载 LoRA，完成后释放显存）
+# 基座 + 单 LoRA，在测试集上推理
 python main.py --method llm --mode predict
 
-# 只推理指定变体
-python main.py --method llm --mode predict --variant base
-python main.py --method llm --mode predict --variant schema
-python main.py --method llm --mode predict --variant cot
+# 评估：ComprehensiveMetrics（与 Pipeline/Joint 完全一致）
+python main.py --method llm --mode evaluate
+
+# 评估指定预测文件
+python main.py --method llm --mode evaluate --input results/llm/predictions.jsonl
 ```
 
-推理产出（方式一，各变体独立目录）：
+产出（`results/llm/`，文件名与 Pipeline/Joint 一致）：
 
 ```
 results/llm/
-├── base/
-│   └── predictions_base.jsonl
-├── schema/
-│   └── predictions_schema.jsonl
-└── cot/
-    └── predictions_cot.jsonl
-```
-
-每条记录格式：
-
-```json
-{
-  "prompt_type": "base",
-  "prompt": "...",
-  "text": "原始文本",
-  "predict": "[('主体', '关系', '客体'), ...]",
-  "label": "[('主体', '关系', '客体'), ...]",
-  "parse_error": false
-}
-```
-
-### 5.3 评估
-
-**方式一（推荐）：使用各变体独立配置文件**
-
-```bash
-# base 变体：指标保存到 results/llm/base/metrics_base.json
-python main.py --method llm --mode evaluate --config configs/llm_base.yaml
-
-# schema 变体
-python main.py --method llm --mode evaluate --config configs/llm_schema.yaml
-
-# cot 变体
-python main.py --method llm --mode evaluate --config configs/llm_cot.yaml
-
-# 指定已有预测文件（--input 仅在单变体时生效）
-python main.py --method llm --mode evaluate --config configs/llm_base.yaml \
-    --input results/llm/base/predictions_base.jsonl
-```
-
-**方式二：使用主配置**
-
-```bash
-# 同时评估全部三种变体，汇总写入 results/llm/metrics.json
-python main.py --method llm --mode evaluate
-
-# 只评估指定变体
-python main.py --method llm --mode evaluate --variant base
-python main.py --method llm --mode evaluate --variant schema
-python main.py --method llm --mode evaluate --variant cot
-```
-
-评估产出（方式一，以 base 为例）：
-
-```
-results/llm/base/
-├── predictions_base.jsonl     — 推理结果
-├── metrics_base.json          — P/R/F1 指标
-└── error_report_base.txt      — 错误类型统计
+├── predictions.jsonl   — 推理结果（text/predict/label/parse_error）
+├── metrics.json        — 严格/宽松 × 微平均/宏平均 + 逐关系 + 错误统计
+├── error_report.txt    — 错误类型汇总
+├── error_cases.txt     — 错误案例详情
+└── per_relation.txt    — 逐关系 P/R/F1
 ```
 
 ---
@@ -377,16 +345,16 @@ python scripts/fine_grained_eval.py
 python scripts/fine_grained_eval.py \
     --pipeline results/pipeline/predictions.jsonl \
     --joint    results/joint/predictions.jsonl \
-    --llm_dir  results/llm
+    --llm      results/llm/predictions.jsonl
 ```
 
 输出示例：
 
 ```
-子集       样本数   Pipeline     Joint  LLM-base  LLM-schema   LLM-cot
-Normal       2850    0.7821    0.8134    0.6210      0.6890    0.7102
-SEO           680    0.6910    0.7230    0.5110      0.5830    0.6210
-EPO           210    0.5820    0.6410    0.4210      0.5010    0.5630
+子集       样本数   Pipeline     Joint       LLM
+Normal       2850    0.7821    0.8134    0.6890
+SEO           680    0.6910    0.7230    0.5830
+EPO           210    0.5820    0.6410    0.5010
 ```
 
 **分类定义**：
@@ -404,7 +372,7 @@ python scripts/density_eval.py
 python scripts/density_eval.py \
     --pipeline results/pipeline/predictions.jsonl \
     --joint    results/joint/predictions.jsonl \
-    --llm_dir  results/llm
+    --llm      results/llm/predictions.jsonl
 ```
 
 输出包含两部分：
@@ -428,8 +396,8 @@ python scripts/low_resource_eval.py --ratios 0.01 0.05 0.10 --methods pipeline j
 # 仅生成采样数据，不训练（适用于 LLM 手动调用 LlamaFactory）
 python scripts/low_resource_eval.py --data_only
 
-# 仅生成 LLM 采样数据
-python scripts/low_resource_eval.py --methods llm --data_only
+# 仅生成 LLM 采样数据（用最优 Prompt，例如 schema）
+python scripts/low_resource_eval.py --methods llm --data_only --prompt schema
 ```
 
 采样数据目录：
@@ -439,7 +407,7 @@ data/processed/low_resource/
 ├── 1pct/
 │   ├── pipeline/train/, dev/, test/
 │   ├── joint/train/, dev/, test/
-│   └── llm/train_base.json, train_schema.json, train_cot.json
+│   └── llm/train.json          # 单 Prompt 的 Alpaca 微调数据（system 字段承载指令）
 ├── 5pct/
 └── 10pct/
 ```
@@ -485,18 +453,18 @@ Research1/
 ├── configs/                    # YAML 超参数配置
 │   ├── pipeline.yaml
 │   ├── joint.yaml
-│   ├── llm.yaml                # LLM 主配置（三路 LoRA 权重，--variant 控制）
-│   ├── llm_base.yaml           # base LoRA 独立配置（推荐单独使用）
-│   ├── llm_schema.yaml         # schema LoRA 独立配置
-│   ├── llm_cot.yaml            # cot LoRA 独立配置
+│   ├── llm.yaml                # LLM 最终测试配置（单 LoRA）
+│   ├── llm_prompt_search.yaml  # 免训练 Prompt 寻优配置（无 LoRA）
 │   └── ablation_*.yaml
 │
 ├── methods/
 │   ├── pipeline/               # NER（BERT-BiLSTM-CRF）→ RE（BERT 分类器）
 │   ├── joint/                  # CasRel 端到端联合抽取
 │   └── llm/
-│       ├── infer.py            # 推理：按 prompt_type 加载独立 LoRA
-│       └── evaluator.py        # 评估：三种 Prompt 类型统一评估
+│       ├── prompt_templates.py # 所有 Prompt 指令的单一事实来源（三处共用）
+│       ├── prompt_search.py    # 免训练 Prompt 寻优核心逻辑（仅基座，禁用 test）
+│       ├── infer.py            # 推理：基座零样本 / 基座+单 LoRA
+│       └── evaluator.py        # 最终测试评估（ComprehensiveMetrics，与基线一致）
 │
 ├── utils/
 │   ├── common.py               # 随机种子、日志、YAML 加载
@@ -504,7 +472,9 @@ Research1/
 │   └── metrics.py              # P/R/F1、错误分析、parse_triple_string
 │
 ├── scripts/
-│   ├── preprocess.py           # 数据预处理（DuIE2.0 → 三种格式）
+│   ├── preprocess.py           # 数据预处理（DuIE2.0 → pipeline/joint/llm-raw）
+│   ├── prompt_search.py        # 免训练 Prompt 寻优入口
+│   ├── build_llm_dataset.py    # 选定最优 Prompt 后构造 train.json/test.json
 │   ├── fine_grained_eval.py    # 细粒度评测（Normal/EPO/SEO）
 │   ├── density_eval.py         # 密度分组评测 + LLM 截断分析
 │   ├── low_resource_eval.py    # 低资源训练对比（1%/5%/10%）
@@ -517,17 +487,15 @@ Research1/
 │
 ├── models/
 │   ├── chatglm2-6b/            # ChatGLM2-6B 基础模型（手动下载）
-│   ├── chatglm2-lora-base/     # LoRA 权重（LlamaFactory 训练产出）
-│   ├── chatglm2-lora-schema/
-│   └── chatglm2-lora-cot/
+│   └── chatglm2-lora/          # 单一 LoRA 权重（LLaMA-Factory 用最优 Prompt 训练产出）
 │
 └── results/                    # 实验结果（自动生成）
     ├── pipeline/
     ├── joint/
     ├── llm/
-    │   ├── base/               # base LoRA 推理/评估结果
-    │   ├── schema/             # schema LoRA 推理/评估结果
-    │   └── cot/                # cot LoRA 推理/评估结果
+    │   ├── prompt_search/      # 免训练寻优结果（ranking.json + 各变体预测）
+    │   ├── predictions.jsonl   # 最终测试预测
+    │   └── metrics.json        # 最终测试指标
     └── low_resource/
 ```
 
@@ -539,25 +507,28 @@ Research1/
 
 - 减小 `batch_size`（configs/joint.yaml 或 pipeline.yaml）
 - LLM 推理时设置 `device: cpu`（速度慢但无 OOM）
-- 确保每次只加载一套 LoRA 权重（infer.py 已自动释放）
 
 **Q: LoRA 权重不存在**
 
 - 推理会自动回退到基础模型，观察日志中 `Warning: LoRA 权重目录不存在`
 - 基础模型推理效果通常低于微调后的模型
 
+**Q: 免训练寻优会不会用到测试集？**
+
+- 不会。`configs/llm_prompt_search.yaml` 的 `search.source_split` 仅允许 `dev` / `train`，
+  指向 `test` 或文件名疑似测试集时，`methods/llm/prompt_search.py` 会直接报错退出。
+
+**Q: 训练和推理的 Prompt 怎么保证一致？**
+
+- 指令文本集中在 `methods/llm/prompt_templates.py`，免训练寻优、最终推理、
+  `dataset_info.json` 三处共用同一份。微调务必用 `--template chatglm2`，
+  并用 `assemble_preview` 对照核对（见 5.2）。
+
 **Q: fine_grained_eval.py 或 density_eval.py 报"未找到预测文件"**
 
 - 请先运行各方法的 evaluate 步骤生成 `predictions.jsonl`
-- LLM 需要先运行 `--mode predict` 再运行 `--mode evaluate`
-- LLM 三个变体需分别运行（使用 `configs/llm_base.yaml` / `llm_schema.yaml` / `llm_cot.yaml`）
-
-**Q: LLM 推理/评估如何选择配置文件？**
-
-- 推荐为每个变体使用独立配置文件（`configs/llm_*.yaml`），结果自动保存到独立目录
-- 需要一次性跑全部三个变体时，使用主配置 `configs/llm.yaml`（不加 `--variant`）
-- `--variant` 参数可以在任意配置文件基础上强制覆盖 prompt 类型
+- LLM 需要先运行 `--mode predict` 再运行 `--mode evaluate`，预测文件为 `results/llm/predictions.jsonl`
 
 **Q: low_resource_eval.py 提示训练文件不存在**
 
-- 请先运行 `python scripts/preprocess.py --method all` 完成预处理
+- 请先运行 `python scripts/preprocess.py --input data/raw/DuIE2.0 --method all` 完成预处理

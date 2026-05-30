@@ -20,7 +20,7 @@ Usage::
     # 只转换 joint 格式
     python scripts/preprocess.py --input data/raw/DuIE2.0 --method joint
 
-    # 只转换 llm 格式（此方法已过时，不再使用）
+    # 只转换 llm 格式（产出 Prompt 无关的 {train,dev,test}_raw.jsonl）
     python scripts/preprocess.py --input data/raw/DuIE2.0 --method llm
 
 数据集目录结构（DuIE2.0 原始格式）::
@@ -524,82 +524,42 @@ def format_joint(
 
 
 # ──────────────────────────────────────────
-# LLM 格式：Alpaca JSON
+# LLM 格式：Prompt 无关的 raw JSONL（{text, triples}）
 # ──────────────────────────────────────────
-
-_LLM_SUBJECT_TYPES = "人物、电视综艺、娱乐人物、影视作品、企业/品牌、歌曲、图书作品、学科专业、机构、行政区、企业、文学作品、学校、国家、历史人物、景点、地点"
-_LLM_OBJECT_TYPES = "学校、人物、歌曲、音乐专辑、Date、Text、Number、气候、城市、地点、奖项、作品、语言、影视作品、企业、国家"
-_LLM_SCHEMA_RELATIONS = "导演、出生地、毕业院校、嘉宾、配音、主题曲、代言人、所属专辑、父亲、作者、上映时间、母亲、专业代码、占地面积、邮政编码、票房、注册资本、主角、妻子、编剧、气候、歌手、获奖、校长、创始人、首都、丈夫、朝代、饰演、面积、总部地点、祖籍、人口数量、制片人、修业年限、所在城市、董事长、作词、改编自、出品公司、作曲、主演、主持人、成立日期、简称、海拔、号、国籍、官方语言"
-
-_FORMAT_REQUIREMENT = (
-    "【重要格式要求】\n"
-    "你只能输出一个合法的 Python 列表结构，形如：[(\"主体\", \"关系\", \"客体\"), ...]\n"
-    "如果没有符合的三元组则输出 []。\n"
-    "绝对不要输出任何前言、后语、解释或 Markdown 代码块标记（如 ```python）。"
-    "你的回复必须直接以 '[' 开头，以 ']' 结尾。"
-)
+#
+# 重构说明：LLM 的具体 Prompt 不在预处理阶段固化。
+# 这里只产出与 Prompt 无关的规范化样本（每行 {"text", "triples"}），三套 split
+# 与 pipeline/joint 同源、同 seed，保证 Train/Val/Test 隔离一致。
+# 之后由 scripts/prompt_search.py（免训练寻优）和 scripts/build_llm_dataset.py
+# （选定最优 Prompt 后构造 Alpaca 微调/测试数据）分别消费这些 raw 文件。
 
 
-def _build_llm_instruction(prompt_type: str) -> str:
-    """返回对应 prompt 类型的 instruction 字段内容（与 infer.py 保持一致）"""
-    if prompt_type == "base":
-        return (
-            "请从以下文本中抽取事实三元组。\n"
-            + _FORMAT_REQUIREMENT
-        )
-    elif prompt_type == "schema":
-        return (
-            "你是一个信息抽取专家。请从以下文本中抽取事实三元组。\n"
-            "【Schema约束】\n"
-            f"1. 主体只能是：{_LLM_SUBJECT_TYPES}\n"
-            f"2. 客体只能是：{_LLM_OBJECT_TYPES}\n"
-            f"3. 关系只能是：{_LLM_SCHEMA_RELATIONS}\n"
-            + _FORMAT_REQUIREMENT.replace(
-                "绝对不要输出任何前言、后语、解释或 Markdown 代码块标记（如 ```python）。",
-                "不要捏造列表以外的关系。绝对不要输出任何解释性文本、废话或 Markdown 代码块标记（如 ```python）。",
-            )
-        )
-    else:  # cot
-        return (
-            "你是一个信息抽取专家。请按照以下步骤从文本中抽取事实三元组：\n"
-            f"主体可选类型：{_LLM_SUBJECT_TYPES}\n"
-            f"客体可选类型：{_LLM_OBJECT_TYPES}\n"
-            f"关系可选类型：{_LLM_SCHEMA_RELATIONS}\n\n"
-            "步骤 1: 识别文本中出现的符合类型的主体和客体实体。\n"
-            "步骤 2: 根据限定的关系列表，判断实体之间存在的关系。\n"
-            "步骤 3: 严格按格式输出最终结果。\n\n"
-            + _FORMAT_REQUIREMENT.replace(
-                "绝对不要输出任何前言、后语、解释或 Markdown 代码块标记（如 ```python）。",
-                "不要捏造列表以外的关系。绝对不要输出任何解释性文本、废话或 Markdown 代码块标记（如 ```python）。",
-            )
-        )
-
-
-def _sample_to_alpaca(sample: Dict, prompt_type: str = "base") -> Dict:
+def _sample_to_raw_llm(sample: Dict) -> Dict:
+    """将 DuIE 样本规范化为 Prompt 无关的 {text, triples} 记录。"""
     text = sample.get("text", "")
-    spo_list = sample.get("spo_list", [])
     triples = []
-    for spo in spo_list:
+    for spo in sample.get("spo_list", []):
         s = spo.get("subject", "")
         p = spo.get("predicate", "")
         obj = spo.get("object", {})
         o = obj.get("@value", "") if isinstance(obj, dict) else str(obj)
         if s and p and o:
-            triples.append(f'("{s}", "{p}", "{o}")')
-    return {
-        "instruction": _build_llm_instruction(prompt_type),
-        "input": f"### 文本\n{text}",
-        "output": f"[{', '.join(triples)}]",
-    }
+            triples.append([s, p, o])
+    return {"text": text, "triples": triples}
 
 
-def format_llm(samples: List[Dict], output_file: str, prompt_type: str = "base") -> None:
-    """生成 LLM（Alpaca 格式）数据，instruction 格式与 infer.py 推理时使用的 prompt 完全一致"""
+def format_llm_raw(samples: List[Dict], output_file: str) -> None:
+    """生成 LLM 用的 Prompt 无关 raw JSONL（每行一个 {text, triples}）。"""
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    data = [_sample_to_alpaca(s, prompt_type) for s in samples]
+    n = 0
     with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    logger.info(f"LLM Alpaca 数据已保存: {output_file} ({len(data)} 条)")
+        for s in samples:
+            rec = _sample_to_raw_llm(s)
+            if not rec["text"]:
+                continue
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            n += 1
+    logger.info(f"LLM raw 数据已保存: {output_file} ({n} 条)")
 
 
 # ──────────────────────────────────────────
@@ -705,20 +665,15 @@ def main():
         logger.info("Joint 数据生成完成")
 
     # LLM
+    # 只产出 Prompt 无关的 raw 文件（{split}_raw.jsonl）。
+    # 免训练寻优、微调数据构造分别由 prompt_search.py / build_llm_dataset.py 消费。
     if args.method in ("all", "llm"):
-        logger.info("=== 生成 LLM 数据 ===")
+        logger.info("=== 生成 LLM raw 数据 ===")
         llm_dir = os.path.join(output_dir, "llm")
         os.makedirs(llm_dir, exist_ok=True)
-        # 每个 split × 三种 prompt 各生成一个文件，共 9 个
-        # 文件名格式：{split}_{prompt_type}.json，如 train_base.json / test_cot.json
         for split_name, samples in splits.items():
-            for ptype in ("base", "schema", "cot"):
-                format_llm(
-                    samples,
-                    os.path.join(llm_dir, f"{split_name}_{ptype}.json"),
-                    prompt_type=ptype,
-                )
-        logger.info("LLM 数据生成完成")
+            format_llm_raw(samples, os.path.join(llm_dir, f"{split_name}_raw.jsonl"))
+        logger.info("LLM raw 数据生成完成")
 
     logger.info(f"所有数据已保存到: {output_dir}")
 

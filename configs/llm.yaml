@@ -1,32 +1,25 @@
-# LLM 方法配置
-# 方法：ChatGLM2-6B + LoRA 微调（仅推理，训练通过 LlamaFactory 完成）
+# LLM 方法配置 — 最终测试推理与评估（单 Prompt / 单 LoRA）
+#
+# 流程：
+#   1. python scripts/prompt_search.py --config configs/llm_prompt_search.yaml   # 免训练选最优 Prompt
+#   2. python scripts/build_llm_dataset.py --prompt <best> --split all           # 构造 train.json / test.json
+#   3. 在 LLaMA-Factory 中用 train.json 微调出单一 LoRA（template=chatglm2）
+#   4. python main.py --method llm --mode predict      # 基座+单 LoRA 在测试集推理
+#      python main.py --method llm --mode evaluate     # ComprehensiveMetrics 评估（与基线一致）
 
 seed: 42
 
 model:
-  # ChatGLM2-6B 基础模型路径（本地路径或 HuggingFace/ModelScope ID）
   base_model: "ZhipuAI/chatglm2-6b"
-  # 三种 Prompt 策略各自对应的 LoRA 权重目录
-  # 若目录不存在则自动回退到基础模型推理
-  lora_weights:
-    base:   "models/chatglm2-lora-base"
-    schema: "models/chatglm2-lora-schema"
-    cot:    "models/chatglm2-lora-cot"
-  # 生成参数
+  # 单一 LoRA 权重目录（LLaMA-Factory 微调产物）；不存在则回退基座推理
+  lora_weights: "models/chatglm2-lora"
   max_new_tokens: 512
   temperature: 0.1
-  # 推理设备（auto / cuda / cpu）
   device: "auto"
 
 data:
-  # 各变体对应的测试文件（由 preprocess.py 生成，格式与训练数据一致）
-  test_files:
-    base:   "data/processed/llm/test_base.json"
-    schema: "data/processed/llm/test_schema.json"
-    cot:    "data/processed/llm/test_cot.json"
-  # 兜底默认值（单独运行 --variant base 且无 test_files 时使用）
-  test_file: "data/processed/llm/test_base.json"
-  predictions_file: "results/llm/predictions.jsonl"
+  # 由 build_llm_dataset.py 用「最优 Prompt」生成，含 system/instruction/output 字段
+  test_file: "data/processed/llm/test.json"
 
 inference:
   per_sample_timeout: 60  # 单条样本最大推理时间（秒），0 表示不限制

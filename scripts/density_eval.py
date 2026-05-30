@@ -18,7 +18,7 @@ Usage::
     python scripts/density_eval.py
     python scripts/density_eval.py --pipeline results/pipeline/predictions.jsonl \\
                                     --joint   results/joint/predictions.jsonl \\
-                                    --llm_dir results/llm
+                                    --llm     results/llm/predictions.jsonl
 """
 
 import argparse
@@ -31,8 +31,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.io_utils import load_jsonl
 from utils.metrics import TripleMetrics, parse_triple_string
-
-LLM_PROMPT_TYPES = ["base", "schema", "cot"]
 
 BUCKETS: List[Tuple[str, int, Optional[int]]] = [
     ("1",   1, 1),
@@ -213,7 +211,7 @@ def main():
     parser = argparse.ArgumentParser(description="三元组密度分组评测 + LLM 截断分析")
     parser.add_argument("--pipeline", default="results/pipeline/predictions.jsonl")
     parser.add_argument("--joint",    default="results/joint/predictions.jsonl")
-    parser.add_argument("--llm_dir",  default="results/llm")
+    parser.add_argument("--llm",      default="results/llm/predictions.jsonl")
     args = parser.parse_args()
 
     method_results:     Dict[str, Dict[str, Dict]] = {}
@@ -235,16 +233,14 @@ def main():
     else:
         print(f"[跳过] {args.joint}")
 
-    # LLM
-    for pt in LLM_PROMPT_TYPES:
-        llm_pred = Path(args.llm_dir) / f"predictions_{pt}.jsonl"
-        if llm_pred.exists():
-            print(f"加载 LLM-{pt}: {llm_pred}")
-            s = load_predictions(str(llm_pred))
-            method_results[f"LLM-{pt}"] = evaluate_by_density(s)
-            llm_large_results[f"LLM-{pt}"] = analyze_llm_large(s)
-        else:
-            print(f"[跳过] {llm_pred}")
+    # LLM（单 Prompt/单 LoRA 的最终测试预测）
+    if Path(args.llm).exists():
+        print(f"加载 LLM: {args.llm}")
+        s = load_predictions(args.llm)
+        method_results["LLM"] = evaluate_by_density(s)
+        llm_large_results["LLM"] = analyze_llm_large(s)
+    else:
+        print(f"[跳过] {args.llm}")
 
     if not method_results:
         print("\n未找到任何预测文件，请先运行评估。")

@@ -113,7 +113,7 @@ python scripts/preprocess.py --input data/raw/DuIE2.0 --method llm
 - `data/processed/pipeline/train/train_ner.txt` — BIO 格式 NER 数据
 - `data/processed/pipeline/train/train_re.txt` — 实体对关系分类数据
 - `data/processed/joint/train/train.json` — CasRel 格式数据
-- `data/processed/llm/train.json` — Alpaca 格式 LLM 训练数据
+- `data/processed/llm/{train,dev,test}_raw.jsonl` — Prompt 无关的 LLM 规范化样本（{text, triples}）
 
 ---
 
@@ -145,18 +145,26 @@ python main.py --method joint --mode evaluate
 python main.py --method joint --mode predict
 ```
 
-### LLM 方法（ChatGLM2-6B + LoRA）
+### LLM 方法（ChatGLM2-6B + 单 LoRA）
 
-**训练说明：** LLM 微调通过 [LlamaFactory](https://github.com/hiyouga/LLaMA-Factory) 完成，本仓库不含训练代码。  
-训练数据已生成于 `data/processed/llm/train.json`（Alpaca 格式），可直接用于 LlamaFactory。
+四步流程（详见 WORKFLOW.md 第 5 节）：
 
 ```bash
-# 推理（需要模型权重）
-python main.py --method llm --mode predict
+# 1. 免训练 Prompt 寻优（仅基座模型，绝不用测试集）→ 选出最优 Prompt
+python scripts/prompt_search.py --config configs/llm_prompt_search.yaml
 
-# 评估（使用已有预测结果，无需重新推理）
-python main.py --method llm --mode evaluate --input results/llm/predictions.jsonl
+# 2. 用最优 Prompt 构造微调/测试数据（固定指令放入 system 字段）
+python scripts/build_llm_dataset.py --prompt <best> --split all
+
+# 3. 在 LLaMA-Factory 中用 data/processed/llm/train.json 微调出单一 LoRA（--template chatglm2）
+
+# 4. 最终测试推理与评估（与 Pipeline/Joint 同一测试集、同一 ComprehensiveMetrics 指标）
+python main.py --method llm --mode predict
+python main.py --method llm --mode evaluate
 ```
+
+> **为什么不再为每个 Prompt 各训一套 LoRA？** LoRA 微调会形成「肌肉记忆」，掩盖 Prompt
+> 指令设计本身的优劣。因此先用免训练寻优挑出最优 Prompt，再只用它微调单一 LoRA。
 
 ### 对比三种方法
 
