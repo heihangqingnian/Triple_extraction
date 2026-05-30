@@ -1,0 +1,30 @@
+# 免训练 Prompt 寻优配置（Zero-shot / Few-shot）
+# 用法：python scripts/prompt_search.py --config configs/llm_prompt_search.yaml
+#
+# 不加载任何 LoRA，用基座模型在验证集小样本上对比各 Prompt 变体的三元组 F1，选最优 Prompt。
+# 绝不使用测试集（source_split 仅允许 dev / train，代码内有硬断言）。
+
+seed: 42
+
+model:
+  base_model: "ZhipuAI/chatglm2-6b"
+  lora_weights: null # 关键：null = 纯基座零样本，不挂任何 LoRA
+  max_new_tokens: 512
+  temperature: 0.1
+  device: "auto"
+
+search:
+  source_split: "dev" # 仅允许 dev 或 train，禁止 test
+  raw_file: "data/processed/llm/dev_raw.jsonl"
+  sample_size: 150 # 随机抽样条数（100-200 之间）
+  prompt_types: ["base", "schema", "cot"]
+  few_shot:
+    enabled: true # 置 true 启用 Few-shot
+    k: 2 # 每条拼入的示例数
+    source: "data/processed/llm/train_raw.jsonl" # 示例只取自训练集，排除评估样本
+
+inference:
+  per_sample_timeout: 60 # 单条样本最大推理时间（秒），0 表示不限制
+
+output:
+  dir: "results/llm/prompt_search_fewshot"

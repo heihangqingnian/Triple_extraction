@@ -19,10 +19,10 @@ model:
 
 data:
   # 由 build_llm_dataset.py 用「最优 Prompt」生成，含 system/instruction/output 字段
-  test_file: "data/processed/llm/test.json"
+  test_file: "data/processed/llm/test_fs2.json"
 
 inference:
-  per_sample_timeout: 60  # 单条样本最大推理时间（秒），0 表示不限制
+  per_sample_timeout: 60 # 单条样本最大推理时间（秒），0 表示不限制
 
 output:
   dir: "results/llm"

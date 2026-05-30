@@ -94,7 +94,8 @@ data/processed/
 
 > LLM 的 Prompt 不在预处理阶段固化。预处理只产出与 Prompt 无关的 `*_raw.jsonl`，
 > 之后由 `scripts/prompt_search.py`（免训练寻优）与 `scripts/build_llm_dataset.py`
-> （选定最优 Prompt 后构造 `train.json` / `test.json`）分别消费。
+> （选定最优 Prompt 后构造 `train.json` / `dev.json` / `test.json`，或 `--few_shot K`
+> 启用固定前缀时输出 `*_fs{K}.json`）分别消费。
 
 ---
 
@@ -220,20 +221,48 @@ python scripts/prompt_search.py --config configs/llm_prompt_search.yaml
 ### 5.2 构造微调 / 测试数据（选定最优 Prompt 后）
 
 ```bash
-# 假设寻优选出 schema 最优
+# 零样本：写出 train.json / dev.json / test.json
 python scripts/build_llm_dataset.py --prompt schema --split all
+
+# 固定前缀 few-shot（推荐：寻优阶段若 schema+few_shot 最优，对齐微调侧）
+# 全数据集共用同一组 K 个示例（取自 train_raw，自动剔除与示例文本重合的样本）
+python scripts/build_llm_dataset.py --prompt schema --split all --few_shot 2
 ```
+
+> `--split all` 现在会**同时生成 train / dev / test 三份**：
+> 训练集用于 LoRA 微调，验证集（dev）供 LLaMA-Factory `--val_dataset` 监控过拟合，
+> 测试集供 `main.py --method llm --mode predict` 评测。如需单独构造某份，
+> 用 `--split train|dev|test`。
+
+新增 CLI 参数（仅 few-shot 相关）：
+
+| 参数               | 默认                                  | 说明                                                       |
+| ------------------ | ------------------------------------- | ---------------------------------------------------------- |
+| `--few_shot K`     | `0`                                   | 固定前缀示例数；`0` = 零样本（旧行为不变），`K>0` 启用     |
+| `--fewshot_source` | `data/processed/llm/train_raw.jsonl` | few-shot 示例采样来源（仅训练集，禁止 test）               |
+| `--fewshot_seed`   | `42`                                  | 采样随机种子，保证可复现                                   |
+| `--suffix`         | 自动                                  | 输出文件 / 数据集名后缀；`K>0` 时默认 `_fs{K}`，可显式覆盖 |
 
 产出（`data/processed/llm/`）：
 
-- `train.json` — LLaMA-Factory 微调数据；**固定指令放入 `system` 字段**，每条不重复
-- `test.json`  — 最终测试推理用（格式与训练完全一致）
-- `dataset_info.json` — LLaMA-Factory 数据集注册片段（映射 system/instruction/output，模板 `chatglm2`）
+- **零样本（`--few_shot 0`，默认）**：`train.json`、`dev.json`、`test.json`、`dataset_info.json`
+  （训练集名 `duie_lora_train`，验证集名 `duie_lora_eval`）
+- **K-shot（`--few_shot K`）**：`train_fs{K}.json`、`dev_fs{K}.json`、`test_fs{K}.json`、`dataset_info.json`
+  （训练集名 `duie_lora_train_fs{K}`，验证集名 `duie_lora_eval_fs{K}`），**不会覆盖零样本产物**
+
+每条 Alpaca 记录的字段约定（两种模式一致）：
+
+- `system` — 固定指令（base/schema/cot 之一），每条不重复
+- `instruction` — 可选 few-shot 块 + `### 文本\n{text}`，由 `build_query()` 拼接
+- `output` — 三元组列表字符串 `[("s","p","o"), ...]`
 
 > **关键一致性**：训练（LLaMA-Factory `chatglm2` 模板 + system）与推理
 > （`methods/llm/infer.py` 复现同一模板 + system）的提示串必须逐字一致，否则 LoRA 失配掉点。
+> few-shot 块已**烤进 `instruction` 字段**，推理时模型自动看到同样的固定前缀，
+> 但 `configs/llm.yaml` 里 `data.test_files.<prompt>` 需指向 few-shot 版（如 `test_fs2.json`），
+> 否则会用零样本版的 test 文件评估，prompt 形态与训练不一致 → 掉点。
 > 二者共用 `prompt_templates.py` 的同一份定义；如需核对，可用
-> `python -c "from methods.llm.prompt_templates import assemble_preview; print(assemble_preview('schema','示例文本'))"`
+> `python -c "from methods.llm.prompt_templates import assemble_preview; print(assemble_preview('schema','示例文本',[('示例文本1',[('s','p','o')])]))"`
 > 打印逻辑提示串，对照你的 LLaMA-Factory 版本确认。
 
 ### 5.3 LoRA 微调（外部 LLaMA-Factory）
@@ -241,12 +270,25 @@ python scripts/build_llm_dataset.py --prompt schema --split all
 `build_llm_dataset.py` 运行结束会打印对齐好的训练命令，核心如下（务必 `--template chatglm2`）：
 
 ```bash
+# 零样本数据集（--few_shot 0 时打印；dev.json 已注册 → 加 --val_dataset 监控过拟合）
 llamafactory-cli train \
     --stage sft --do_train \
     --model_name_or_path ZhipuAI/chatglm2-6b \
     --finetuning_type lora --template chatglm2 \
-    --dataset duie_lora_train --dataset_dir data/processed/llm \
+    --dataset duie_lora_train --val_dataset duie_lora_eval \
+    --dataset_dir data/processed/llm \
     --output_dir models/chatglm2-lora \
+    --num_train_epochs 3 --per_device_train_batch_size 4 \
+    --learning_rate 2e-4 --lora_rank 8 --cutoff_len 1024
+
+# K-shot 数据集（--few_shot 2 时打印；数据集名自动带 _fs{K} 后缀）
+llamafactory-cli train \
+    --stage sft --do_train \
+    --model_name_or_path ZhipuAI/chatglm2-6b \
+    --finetuning_type lora --template chatglm2 \
+    --dataset duie_lora_train_fs2 --val_dataset duie_lora_eval_fs2 \
+    --dataset_dir data/processed/llm \
+    --output_dir models/chatglm2-lora-fs2 \
     --num_train_epochs 3 --per_device_train_batch_size 4 \
     --learning_rate 2e-4 --lora_rank 8 --cutoff_len 1024
 ```
