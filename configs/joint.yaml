@@ -24,7 +24,7 @@ model:
   # 最大训练 epoch 数
   epochs: 300
   # 每隔多少 epoch 在验证集上评估一次
-  eval_every: 5
+  eval_every: 1
   # 每隔多少步打印一次训练损失
   log_every: 50
   # CasRel 预测阈值（主语/宾语头尾概率 > threshold 则认定存在）

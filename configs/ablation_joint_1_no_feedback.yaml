@@ -5,7 +5,7 @@ seed: 42
 
 data:
   processed_dir: "data/processed/joint"
-  rel2id: "data/processed/shared/rel2id.json"
+  rel2id: "data/processed/joint/rel2id.json"
   train_prefix: "train"
   dev_prefix: "dev"
   test_prefix: "test"

@@ -97,7 +97,7 @@ def load_model(cfg: dict, prompt_type: str = "base"):
 
     tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
 
-    load_kwargs = {"trust_remote_code": True, "dtype": dtype}
+    load_kwargs = {"trust_remote_code": True, "torch_dtype": dtype}
     if device_map is not None:
         load_kwargs["device_map"] = device_map
 
@@ -241,7 +241,7 @@ def predict_sample(
             )
             return list(parse_triple_string(response or ""))
         except Exception as e:
-            logger.warning(f"model.chat() 失败，回退到 generate(): {e}")
+            logger.warning(f"[DBG] chat() failed ({type(e).__name__}): {e}")
 
     # ── 方法二：手动 tokenize + model.generate() ─────────────
     if hasattr(tokenizer, "build_prompt"):
@@ -368,15 +368,15 @@ def predict_file(
             err_box: list = [None]
             done = threading.Event()
 
-            def _infer(ps=prompt_str):
+            def _infer(ps=prompt_str, _rb=result_box, _eb=err_box, _done=done):
                 try:
-                    result_box[0] = predict_sample(
+                    _rb[0] = predict_sample(
                         "", model, tokenizer, cfg, prompt_type,
                         prompt=ps, timeout=per_sample_timeout,
                     )
                 except Exception as exc:
-                    err_box[0] = exc
-                done.set()
+                    _eb[0] = exc
+                _done.set()
 
             threading.Thread(target=_infer, daemon=True).start()
             timed_out = not done.wait(
