@@ -106,16 +106,25 @@ def load_checkpoint(
 
     # 兼容旧格式：直接保存 state_dict 而非完整 checkpoint dict
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-        if optimizer and checkpoint.get("optimizer_state_dict"):
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        model_state_dict = checkpoint["model_state_dict"]
     elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         # 兼容 Bert_based_extraction 旧格式
-        model.load_state_dict(checkpoint["state_dict"])
-        if optimizer and checkpoint.get("optimizer"):
-            optimizer.load_state_dict(checkpoint["optimizer"])
+        model_state_dict = checkpoint["state_dict"]
     else:
         # 直接是 state_dict
-        model.load_state_dict(checkpoint)
+        model_state_dict = checkpoint
+
+    # 处理 BERT position_ids 缺失问题（position_ids 是动态生成的，可能未保存）
+    model_state_dict = {k: v for k, v in model_state_dict.items() if not k.endswith(".position_ids")}
+    
+    # 加载模型参数（允许忽略未匹配的键）
+    model.load_state_dict(model_state_dict, strict=False)
+    
+    # 加载优化器参数
+    if optimizer:
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        elif "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
 
     return checkpoint

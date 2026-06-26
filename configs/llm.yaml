@@ -12,7 +12,7 @@ seed: 42
 model:
   base_model: "ZhipuAI/chatglm2-6b"
   # 单一 LoRA 权重目录（LLaMA-Factory 微调产物）；不存在则回退基座推理
-  lora_weights: "models/chatglm2-lora"
+  lora_weights: "models"
   max_new_tokens: 512
   temperature: 0.1
   device: "auto"
